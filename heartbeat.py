@@ -7,24 +7,29 @@ Comme le système nerveux autonome : le cœur bat sans que le cerveau l'ordonne.
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 import httpx
 import redis.asyncio as aioredis
 
 from config import CFG
+from core.logger import get_logger
+
+log = get_logger(__name__)
 
 
 class HeartbeatService:
     def __init__(self):
-        self._http  = httpx.AsyncClient(timeout=5.0)
+        # Pas de client httpx persistant — on utilise des context managers dans chaque méthode
         self._redis = None
         self._down  = {}
-        self._briefing_done_today = False
+        # Clé = date du jour (date object), valeur = bool
+        # Permet un reset automatique à minuit sans logique explicite
+        self._briefing_done: dict[date, bool] = {}
 
     async def start(self, redis_client=None):
         self._redis = redis_client or await aioredis.from_url(CFG.REDIS)
-        print("[Heartbeat] Service autonome démarré.")
+        log.info("heartbeat_started")
         await asyncio.gather(
             self._health_loop(),
             self._briefing_loop(),
@@ -39,47 +44,56 @@ class HeartbeatService:
             "Comp. Use": f"{CFG.GHOST_CU}/health",
         }
         while True:
-            for name, url in checks.items():
-                try:
-                    await self._http.get(url)
-                    if self._down.get(name):
-                        await self._alert(f"{name} est de retour en ligne, {CFG.OWNER}.", "info")
-                        self._down[name] = False
-                except Exception:
-                    if not self._down.get(name):
-                        await self._alert(f"⚠️ {name} est tombé, {CFG.OWNER}.", "warn")
-                        self._down[name] = True
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                for name, url in checks.items():
+                    try:
+                        await c.get(url)
+                        if self._down.get(name):
+                            await self._alert(f"{name} est de retour en ligne, {CFG.OWNER}.", "info")
+                            self._down[name] = False
+                            log.info("service_recovered", service=name)
+                    except Exception as e:
+                        if not self._down.get(name):
+                            await self._alert(f"⚠️ {name} est tombé, {CFG.OWNER}.", "warn")
+                            self._down[name] = True
+                            log.warning("service_down", service=name, error=str(e))
             await asyncio.sleep(60)
 
     # ─── Briefing matinal (8h00) ──────────────────────────────────────────
     async def _briefing_loop(self):
         while True:
-            now = datetime.now()
-            if now.hour == 8 and now.minute < 5 and not self._briefing_done_today:
+            now      = datetime.now()
+            today    = now.date()
+            # Le briefing n'est fait qu'une seule fois par date calendaire
+            already  = self._briefing_done.get(today, False)
+            if now.hour == 8 and now.minute < 5 and not already:
                 await self._morning_briefing()
-                self._briefing_done_today = True
-            if now.hour == 0:
-                self._briefing_done_today = False
+                self._briefing_done[today] = True
+                # Nettoyage des entrées passées pour éviter la croissance infinie
+                self._briefing_done = {k: v for k, v in self._briefing_done.items() if k >= today}
             await asyncio.sleep(60)
 
     async def _morning_briefing(self):
         status_parts = []
 
-        try:
-            r = await self._http.get(f"{CFG.GHOST_URL}/api/status")
-            data     = r.json()
-            missions = data.get("missions", {}).get("total", 0)
-            uptime   = data.get("uptime", 0)
-            status_parts.append(f"Ghost OS: actif depuis {uptime // 3600}h, {missions} missions totales")
-        except Exception:
-            status_parts.append("Ghost OS: indisponible")
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            try:
+                r        = await c.get(f"{CFG.GHOST_URL}/api/status")
+                data     = r.json()
+                missions = data.get("missions", {}).get("total", 0)
+                uptime   = data.get("uptime", 0)
+                status_parts.append(f"Ghost OS: actif depuis {uptime // 3600}h, {missions} missions totales")
+            except Exception as e:
+                status_parts.append("Ghost OS: indisponible")
+                log.warning("briefing_ghost_unavailable", error=str(e))
 
-        try:
-            r      = await self._http.get(f"{CFG.OLLAMA}/api/tags")
-            models = r.json().get("models", [])
-            status_parts.append(f"Ollama: {len(models)} modèles disponibles")
-        except Exception:
-            status_parts.append("Ollama: indisponible")
+            try:
+                r      = await c.get(f"{CFG.OLLAMA}/api/tags")
+                models = r.json().get("models", [])
+                status_parts.append(f"Ollama: {len(models)} modèles disponibles")
+            except Exception as e:
+                status_parts.append("Ollama: indisponible")
+                log.warning("briefing_ollama_unavailable", error=str(e))
 
         date_str       = datetime.now().strftime("%A %d %B %Y")
         status_context = "\n".join(status_parts)
@@ -106,11 +120,12 @@ Briefing (voix de Jarvis, ton britannique, appelle "{CFG.OWNER}") :"""
                 )
             briefing = resp.json().get("message", {}).get("content",
                 f"Bonjour {CFG.OWNER}, systèmes opérationnels.")
-        except Exception:
+        except Exception as e:
             briefing = f"Bonjour {CFG.OWNER}, systèmes opérationnels. Bonne journée."
+            log.warning("briefing_llm_error", error=str(e))
 
         await self._alert(briefing, "briefing")
-        print(f"[Heartbeat] Briefing matinal envoyé: {briefing[:80]}")
+        log.info("briefing_sent", preview=briefing[:80])
 
     # ─── Surveillance disque (toutes les 5 min) ───────────────────────────
     async def _disk_monitor(self):
@@ -124,6 +139,7 @@ Briefing (voix de Jarvis, ton britannique, appelle "{CFG.OWNER}") :"""
                     f"⚠️ Espace disque faible: {free_gb} GB restants, {CFG.OWNER}.", "warn"
                 )
                 alerted_disk = True
+                log.warning("disk_low", free_gb=free_gb)
             elif free_gb >= 15:
                 alerted_disk = False
             await asyncio.sleep(300)
@@ -136,4 +152,4 @@ Briefing (voix de Jarvis, ton britannique, appelle "{CFG.OWNER}") :"""
             "message": message,
             "ts":      time.time(),
         }))
-        print(f"[Heartbeat] [{level.upper()}] {message}")
+        log.info("alert_published", level=level, message=message[:80])

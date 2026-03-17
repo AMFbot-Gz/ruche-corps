@@ -76,3 +76,6 @@ class CFG:
     # APIs cloud
     OPENAI_KEY = _e("OPENAI_API_KEY")
     GITHUB_TK  = _e("GITHUB_TOKEN")
+
+    # Logging
+    LOG_LEVEL  = _e("LOG_LEVEL", "INFO")

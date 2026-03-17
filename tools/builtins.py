@@ -489,38 +489,159 @@ async def mixture_answer(question: str) -> str:
 # MÉMOIRE
 # ═══════════════════════════════════════════════════════════════
 
-@tool("Mémoriser un fait important de façon permanente", "memory")
+@tool("Mémoriser un fait important de façon permanente dans la mémoire vectorielle", "memory")
 async def remember(fact: str, category: str = "general") -> str:
     """
-    fact: information à mémoriser
-    category: catégorie (general, user, project, tech)
+    fact: information à mémoriser (sera indexée sémantiquement pour rappel futur)
+    category: catégorie (general, user, project, tech, preference)
+    """
+    from memory import RucheMemory
+    mem = RucheMemory()
+    await mem.initialize()
+    try:
+        # Sauvegarde dans ChromaDB (vectorielle) + Redis (backup)
+        ok = await mem.remember_fact(fact, category=category)
+        status = "vectorielle + Redis" if ok else "Redis seulement (ChromaDB indisponible)"
+        return f"Mémorisé [{category}] ({status}): {fact[:120]}"
+    except Exception as e:
+        return f"Erreur mémorisation: {e}"
+    finally:
+        await mem.close()
+
+
+@tool("Rappeler des souvenirs via recherche sémantique (cherche par sens, pas par mot-clé)", "memory")
+async def recall(query: str, n: int = 5) -> str:
+    """
+    query: ce qu'on cherche à se rappeler (en langage naturel)
+    n: nombre de résultats à retourner (défaut 5)
+    """
+    from memory import RucheMemory
+    mem = RucheMemory()
+    await mem.initialize()
+    try:
+        # Recherche vectorielle dans les faits mémorisés
+        facts = await mem.search_facts(query, n=n)
+
+        if not facts:
+            # Fallback : recherche dans tous les épisodes si pas de faits
+            episodes = await mem.search(query, n_results=n)
+            if not episodes:
+                return f"Aucun souvenir trouvé pour: {query}"
+            lines = [
+                f"[Episode — {ep['date']} — similarité {ep['score']}]\n{ep['text'][:250]}"
+                for ep in episodes
+            ]
+            return f"Souvenirs trouvés ({len(lines)}):\n\n" + "\n\n".join(lines)
+
+        lines = [
+            f"[{f['category']} — similarité {f['score']}] {f['text']}"
+            for f in facts
+        ]
+        return f"Souvenirs trouvés ({len(lines)}):\n\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Erreur recall: {e}"
+    finally:
+        await mem.close()
+
+
+@tool("Résumer et compresser une longue session en mémoire", "memory")
+async def summarize_session(session_id: str = "") -> str:
+    """
+    session_id: ID de session à résumer (vide = utilise 'default')
+    Génère un résumé 3-5 phrases si la session dépasse 10 échanges.
+    """
+    from memory import RucheMemory
+    mem = RucheMemory()
+    await mem.initialize()
+    try:
+        sid = session_id.strip() or "default"
+        summary = await mem.summarize_if_long(sid, threshold=10)
+        if summary is None:
+            history = await mem.get_session_history(sid)
+            count   = len(history)
+            if count == 0:
+                return f"Session '{sid}' introuvable ou vide."
+            return (
+                f"Session '{sid}' contient {count} échange(s) — "
+                f"résumé non nécessaire (seuil: 10 échanges)."
+            )
+        return f"Résumé de la session '{sid}':\n\n{summary}"
+    except Exception as e:
+        return f"Erreur résumé session: {e}"
+    finally:
+        await mem.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# MISSIONS AUTONOMES (Worker de nuit)
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Soumettre une mission longue au worker autonome (tâche par tâche, même la nuit)", "missions")
+async def submit_mission(mission: str, priority: int = 3) -> str:
+    """
+    mission: description complète de la mission à accomplir
+    priority: priorité 1 (urgent) à 5 (basse), défaut=3
     """
     try:
         import redis.asyncio as aioredis
-        r   = await aioredis.from_url(CFG.REDIS)
-        key = f"ruche:fact:{abs(hash(fact)) % 1_000_000}"
-        await r.setex(key, 86400 * 30, json.dumps({"fact": fact, "category": category}))
+        from missions.queue import MissionQueue
+        r     = await aioredis.from_url(CFG.REDIS)
+        queue = MissionQueue(r)
+        mid   = await queue.push(mission, priority=priority, source="agent")
+        size  = await queue.size()
         await r.aclose()
-    except Exception:
-        pass
-    return f"✅ Mémorisé [{category}]: {fact[:100]}"
+        return (
+            f"✅ Mission soumise : {mid}\n"
+            f"Position dans la file : {size}\n"
+            f"Priorité : {priority}/5\n"
+            f"Mission : {mission[:200]}\n\n"
+            f"Le worker autonome prendra en charge cette mission tâche par tâche.\n"
+            f"Tu recevras des rapports de progression sur Telegram."
+        )
+    except Exception as e:
+        return f"❌ Erreur soumission mission: {e}"
 
 
-@tool("Rappeler des souvenirs ou faits mémorisés", "memory")
-async def recall(query: str) -> str:
-    """query: mot-clé ou sujet à rechercher dans la mémoire"""
+@tool("Voir l'état de la file de missions autonomes", "missions")
+async def mission_status() -> str:
+    """Affiche les missions en attente, active, et récemment terminées."""
     try:
         import redis.asyncio as aioredis
+        from missions.queue import MissionQueue
         r     = await aioredis.from_url(CFG.REDIS)
-        keys  = await r.keys("ruche:fact:*")
-        facts = []
-        for k in keys[:100]:
-            d = await r.get(k)
-            if d:
-                obj = json.loads(d)
-                if query.lower() in obj.get("fact", "").lower():
-                    facts.append(f"[{obj.get('category','?')}] {obj['fact']}")
+        queue = MissionQueue(r)
+        s     = await queue.status()
         await r.aclose()
-        return "\n".join(facts) if facts else f"Aucun souvenir pour: {query}"
+
+        lines = [f"📋 **File de missions**\n"]
+        lines.append(f"• En attente : {s['pending']}")
+
+        if s['active']:
+            lines.append(f"• Active : {s['active']['mission'][:80]}")
+        else:
+            lines.append("• Active : aucune")
+
+        if s['recent_done']:
+            lines.append("\n✅ **Récemment terminées :**")
+            for m in s['recent_done'][:5]:
+                res = m.get('result_summary', '')
+                lines.append(f"  • {m['mission'][:60]} — {res}")
+        return "\n".join(lines)
     except Exception as e:
-        return f"Mémoire indisponible: {e}"
+        return f"❌ Erreur status missions: {e}"
+
+
+@tool("Annuler toutes les missions en attente dans la file", "missions")
+async def clear_missions() -> str:
+    """Vide la file de missions (pas la mission active en cours)."""
+    try:
+        import redis.asyncio as aioredis
+        from missions.queue import MissionQueue
+        r     = await aioredis.from_url(CFG.REDIS)
+        queue = MissionQueue(r)
+        size  = await queue.size()
+        await queue.clear()
+        await r.aclose()
+        return f"✅ File vidée — {size} mission(s) supprimée(s)"
+    except Exception as e:
+        return f"❌ Erreur clear missions: {e}"

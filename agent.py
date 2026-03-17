@@ -17,12 +17,18 @@ from datetime import datetime
 
 import httpx
 import redis.asyncio as aioredis
+from pydantic import ValidationError
 
 from config import CFG
+from core.logger import get_logger
+from core.resilience import get_ollama_client, CircuitOpenError
+from core.schemas import InboundMessage
 from memory import Memory
 from router import Router
 from tools.registry import registry
 from context.builder import ContextBuilder
+
+log = get_logger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
 # SYSTEM PROMPT — Définit l'identité et les capacités
@@ -71,6 +77,7 @@ class RucheAgent:
         self.memory   = Memory()
         self.router   = Router()
         self.ctx      = ContextBuilder()
+        # _http conservé pour les appels non-Ollama (streaming, etc.)
         self._http    = httpx.AsyncClient(timeout=180.0)
         import tools.builtins  # enregistrement @tool
 
@@ -80,10 +87,14 @@ class RucheAgent:
         await self.redis.ping()
         await self.memory.initialize()
         tools_list = registry.list_tools()
-        print(f"[Agent] ✅ Redis + ChromaDB prêts")
-        print(f"[Agent] ✅ {len(tools_list)} outils: {', '.join(tools_list)}")
-        print(f"[Agent] 🧠 Modèle principal: {CFG.M_GENERAL} ({CFG.NEMOTRON_CTX//1000}K ctx)")
-        print(f"[Agent] 🔴 Écoute sur {CFG.CH_IN}")
+        log.info("agent_started",
+                 redis="ok",
+                 chromadb="ok",
+                 tool_count=len(tools_list),
+                 tools=", ".join(tools_list),
+                 model=CFG.M_GENERAL,
+                 ctx_k=CFG.NEMOTRON_CTX // 1000,
+                 channel=CFG.CH_IN)
         async with self.redis.pubsub() as ps:
             await ps.subscribe(CFG.CH_IN)
             async for msg in ps.listen():
@@ -91,23 +102,39 @@ class RucheAgent:
                     try:
                         asyncio.create_task(self._dispatch(json.loads(msg["data"])))
                     except Exception as e:
-                        print(f"[Agent] Dispatch error: {e}")
+                        log.error("dispatch_error", error=str(e))
 
     # ── Dispatch d'un message ─────────────────────────────────
     async def _dispatch(self, data: dict):
-        t0      = time.monotonic()
-        channel = data.get("channel", "cli")
-        uid     = data.get("user_id", "local")
-        text    = data.get("text", "").strip()
-        sid     = f"{channel}:{uid}"
+        t0 = time.monotonic()
+
+        # Validation stricte du message entrant
+        try:
+            msg = InboundMessage.model_validate(data)
+        except ValidationError as e:
+            log.error("inbound_validation_error",
+                      errors=e.errors(),
+                      raw_data=str(data)[:200])
+            return
+
+        channel = msg.channel
+        uid     = msg.user_id
+        text    = msg.text.strip()
+        sid     = msg.session_id if msg.session_id != "unknown" else f"{channel}:{uid}"
+
         if not text:
             return
-        print(f"[Agent] [{channel}] {text[:80]}")
+
+        log.info("message_received", channel=channel, text_preview=text[:80], session_id=sid)
 
         # Routage modèle
         route = await self.router.classify(text)
         model = route.model
-        print(f"[Agent] → {model} ({route.reasoning_type}) {route.latency_ms:.0f}ms")
+        log.info("route_selected",
+                 model=model,
+                 reasoning_type=route.reasoning_type,
+                 latency_ms=round(route.latency_ms, 1),
+                 session_id=sid)
 
         # Mémoire vectorielle
         mem_ctx   = await self.memory.search_relevant(text, n=3, session_id=sid)
@@ -148,7 +175,11 @@ class RucheAgent:
         await self._history_set(sid, text, answer)
 
         ms = (time.monotonic() - t0) * 1000
-        print(f"[Agent] Répondu en {ms:.0f}ms | {answer[:60]}...")
+        log.info("response_sent",
+                 session_id=sid,
+                 model=model,
+                 ms=round(ms, 1),
+                 answer_preview=answer[:60])
 
         await self.redis.publish(CFG.CH_OUT, json.dumps({
             "channel":    channel,
@@ -174,9 +205,11 @@ class RucheAgent:
         if is_nemotron:
             options["num_ctx"] = CFG.NEMOTRON_CTX
 
+        ollama = get_ollama_client()
+
         for i in range(max_iter):
             payload = {
-                "model":   model,
+                "model":    model,
                 "messages": [{"role": "system", "content": system}] + msgs,
                 "stream":   True,
                 "tools":    tools,
@@ -186,8 +219,9 @@ class RucheAgent:
             tool_calls = []
 
             try:
+                # Streaming via httpx direct (get_ollama_client ne gère pas le streaming SSE)
                 async with self._http.stream("POST", f"{CFG.OLLAMA}/api/chat",
-                                              json=payload) as resp:
+                                             json=payload) as resp:
                     async for line in resp.aiter_lines():
                         if not line:
                             continue
@@ -208,8 +242,11 @@ class RucheAgent:
                                 "name":      fn.get("name", ""),
                                 "arguments": fn.get("arguments", {}),
                             })
+            except CircuitOpenError as e:
+                log.error("llm_circuit_open", iter=i, session_id=sid, error=str(e))
+                return f"Service IA temporairement indisponible: {e}"
             except Exception as e:
-                print(f"[Agent] LLM error iter={i}: {e}")
+                log.error("llm_error", iter=i, session_id=sid, error=str(e))
                 if content:
                     return content.strip()
                 return f"Erreur de connexion au modèle: {e}"
@@ -220,7 +257,7 @@ class RucheAgent:
 
             # Exécution parallèle des outils
             names = [tc["name"] for tc in tool_calls]
-            print(f"[Agent] iter={i+1} outils={names}")
+            log.info("tool_calls_executing", iter=i + 1, tools=names, session_id=sid)
             results = await registry.execute_parallel(tool_calls)
 
             # Réinjecter dans le contexte

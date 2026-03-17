@@ -17,6 +17,10 @@ from typing import Optional
 import httpx
 
 from config import CFG as CONFIG
+from core.logger import get_logger
+from core.resilience import get_ollama_client, CircuitOpenError
+
+log = get_logger(__name__)
 
 
 # ─── Types de raisonnement ────────────────────────────────────────────────────
@@ -90,7 +94,7 @@ Réponds UNIQUEMENT avec le JSON, rien d'autre."""
 # ─── Router ───────────────────────────────────────────────────────────────────
 class Router:
     def __init__(self, config=CONFIG):
-        self.cfg = config
+        self.cfg     = config
         self._client = httpx.AsyncClient(timeout=5.0)
 
     async def classify(self, text: str, history_len: int = 0) -> RouteDecision:
@@ -126,23 +130,32 @@ class Router:
             # Extraire JSON même si le modèle ajoute du texte
             m = re.search(r'\{.*\}', raw, re.DOTALL)
             if m:
-                data = json.loads(m.group())
-                r_type = data.get("type", REASON_GENERAL)
-                priority = int(data.get("priority", 3))
-                explanation = data.get("reason", "")
-                return RouteDecision(
-                    model=_type_to_model(r_type),
-                    reasoning_type=r_type,
-                    priority=priority,
-                    fast_path=False,
-                    explanation=explanation,
-                    latency_ms=(time.monotonic() - t0) * 1000,
-                )
+                try:
+                    data       = json.loads(m.group())
+                    r_type     = data.get("type", REASON_GENERAL)
+                    priority   = int(data.get("priority", 3))
+                    explanation = data.get("reason", "")
+                    return RouteDecision(
+                        model=_type_to_model(r_type),
+                        reasoning_type=r_type,
+                        priority=priority,
+                        fast_path=False,
+                        explanation=explanation,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                except (json.JSONDecodeError, ValueError) as parse_err:
+                    log.error("router_json_parse_error",
+                              raw=raw[:200],
+                              error=str(parse_err))
+                    # Fallback ci-dessous
+        except CircuitOpenError as e:
+            log.warning("router_circuit_open", error=str(e))
         except Exception as e:
-            pass  # Fallback ci-dessous
+            log.warning("router_llm_error", error=str(e))
 
         # 3. Fallback : longueur du texte comme heuristique
         r_type = REASON_GENERAL if len(text) < 200 else REASON_REASONING
+        log.debug("router_fallback", text_len=len(text), chosen_type=r_type)
         return RouteDecision(
             model=CONFIG.M_GENERAL,
             reasoning_type=r_type,

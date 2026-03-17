@@ -43,7 +43,39 @@ if [ -f ~/Projects/ghost-os-ultimate/src/queen_oss.js ]; then
   fi
 fi
 
-# 4. Lancer l'agent
+# 4. Worker autonome (mode nuit)
+mkdir -p ~/.ruche/logs ~/.ruche/reports
+WORKER_PID_FILE="$DIR/.worker.pid"
+if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
+  echo "✅ Worker déjà actif (PID $(cat "$WORKER_PID_FILE"))"
+else
+  echo "▶ Démarrage Worker autonome..."
+  PYTHONUNBUFFERED=1 python3 -u "$DIR/worker.py" \
+    >> ~/.ruche/logs/worker.log 2>&1 &
+  WORKER_PID=$!
+  echo "$WORKER_PID" > "$WORKER_PID_FILE"
+  echo "✅ Worker démarré (PID $WORKER_PID) → logs: ~/.ruche/logs/worker.log"
+fi
+
+# 4b. Watchdog (surveillance auto-réparation)
+WATCHDOG_PID_FILE="$DIR/.watchdog.pid"
+if [ -f "$WATCHDOG_PID_FILE" ] && kill -0 "$(cat "$WATCHDOG_PID_FILE")" 2>/dev/null; then
+  echo "✅ Watchdog déjà actif (PID $(cat "$WATCHDOG_PID_FILE"))"
+else
+  echo "▶ Démarrage Watchdog..."
+  PYTHONUNBUFFERED=1 python3 -u "$DIR/watchdog.py" >> ~/.ruche/logs/watchdog.log 2>&1 &
+  echo $! > "$WATCHDOG_PID_FILE"
+  echo "✅ Watchdog démarré → ~/.ruche/logs/watchdog.log"
+fi
+
+# 4c. Goals Loop (si --goals est passé)
+if [[ "$*" == *"--goals"* ]]; then
+  echo "▶ Démarrage Goals Loop..."
+  PYTHONUNBUFFERED=1 python3 -u "$DIR/goals.py" >> ~/.ruche/logs/goals.log 2>&1 &
+  echo "✅ Goals Loop démarré → ~/.ruche/logs/goals.log"
+fi
+
+# 5. Lancer l'agent
 echo ""
 echo "▶ Démarrage La Ruche Agent..."
 exec python3 "$DIR/main.py" "$@"
