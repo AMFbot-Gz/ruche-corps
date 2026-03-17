@@ -159,6 +159,7 @@ def _tool_count() -> int:
     try:
         sys.path.insert(0, str(DIR))
         from tools.registry import registry
+        import tools.builtins  # déclenche l'enregistrement des outils
         return len(registry.list_tools())
     except Exception:
         return 0
