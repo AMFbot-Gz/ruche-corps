@@ -51,6 +51,12 @@ class RucheMemory:
         self._redis = None       # Connexion Redis lazy
         self._chroma_ok = False  # Flag : ChromaDB opérationnel
 
+        # 4 collections pour les 4 couches de mémoire
+        self._episodic   = None  # Ce qui s'est passé (événements)
+        self._semantic   = None  # Ce que j'ai appris (faits + règles)
+        self._procedural = None  # Comment faire (séquences réussies)
+        self._active     = None  # Contexte immédiat (working memory, TTL court)
+
     # ─── Initialisation ───────────────────────────────────────────────────────
 
     async def initialize(self):
@@ -68,6 +74,10 @@ class RucheMemory:
                 "knowledge",
                 metadata={"hnsw:space": "cosine"},
             )
+            self._episodic   = self._chroma.get_or_create_collection("episodic",   metadata={"hnsw:space": "cosine"})
+            self._semantic   = self._chroma.get_or_create_collection("semantic",   metadata={"hnsw:space": "cosine"})
+            self._procedural = self._chroma.get_or_create_collection("procedural", metadata={"hnsw:space": "cosine"})
+            self._active     = self._chroma.get_or_create_collection("active",     metadata={"hnsw:space": "cosine"})
             self._chroma_ok = True
             total = self._episodes.count() + self._knowledge.count()
             logger.info(f"[Memory] ChromaDB prête — {total} souvenirs chargés.")
@@ -521,6 +531,245 @@ class RucheMemory:
 
         return saved
 
+    # ─── Mémoire procédurale ──────────────────────────────────────────────────
+
+    async def store_procedural(self, task: str, tool_sequence: list[str], result: str,
+                                success: bool, confidence: float = 0.8):
+        """Mémorise une séquence d'outils qui a (bien ou mal) fonctionné."""
+        if not self._chroma_ok or self._procedural is None:
+            return
+
+        text = f"{task}\n{result}"
+        embedding = await self._embed(text)
+        if embedding is None:
+            return
+
+        doc_id = hashlib.sha256(f"{task}{str(tool_sequence)}".encode()).hexdigest()[:16]
+        try:
+            self._procedural.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[text],
+                metadatas=[{
+                    "success":    str(success),
+                    "tools":      json.dumps(tool_sequence),
+                    "confidence": confidence,
+                    "timestamp":  datetime.now().isoformat(),
+                }],
+            )
+            logger.info(f"[Memory] Procédure mémorisée (success={success}): {task[:60]}")
+        except Exception as e:
+            logger.error(f"[Memory] store_procedural error: {e}")
+
+    async def get_procedural(self, task: str, n: int = 3) -> list[dict]:
+        """Retrouve les séquences réussies similaires à cette tâche."""
+        if not self._chroma_ok or self._procedural is None:
+            return []
+
+        count = self._procedural.count()
+        if count == 0:
+            return []
+
+        embedding = await self._embed(task)
+        if embedding is None:
+            return []
+
+        try:
+            results = self._procedural.query(
+                query_embeddings=[embedding],
+                n_results=min(n * 2, count),
+                include=["documents", "metadatas", "distances"],
+                where={"success": "True"},
+            )
+            docs  = results["documents"][0]
+            metas = results["metadatas"][0]
+            dists = results["distances"][0]
+
+            output = []
+            for doc, meta, dist in zip(docs, metas, dists):
+                output.append({
+                    "text":       doc,
+                    "tools":      json.loads(meta.get("tools", "[]")),
+                    "confidence": meta.get("confidence", 0.5),
+                    "score":      round(1.0 - dist, 3),
+                })
+            return output[:n]
+        except Exception as e:
+            logger.error(f"[Memory] get_procedural error: {e}")
+            return []
+
+    # ─── Mémoire sémantique ───────────────────────────────────────────────────
+
+    async def store_semantic(self, fact: str, source: str, confidence: float = 0.9):
+        """Mémorise un fait ou une règle généralisée avec score de confiance."""
+        if not self._chroma_ok or self._semantic is None:
+            return
+
+        embedding = await self._embed(fact)
+        if embedding is None:
+            return
+
+        doc_id = hashlib.sha256(fact.encode()).hexdigest()[:16]
+        try:
+            self._semantic.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[fact],
+                metadatas=[{
+                    "source":     source,
+                    "confidence": confidence,
+                    "timestamp":  datetime.now().isoformat(),
+                }],
+            )
+            logger.info(f"[Memory] Fait sémantique mémorisé (conf={confidence}): {fact[:60]}")
+        except Exception as e:
+            logger.error(f"[Memory] store_semantic error: {e}")
+
+    async def get_semantic(self, query: str, min_confidence: float = 0.6, n: int = 5) -> list[dict]:
+        """Retrouve les faits/règles pertinents avec confiance >= min_confidence."""
+        if not self._chroma_ok or self._semantic is None:
+            return []
+
+        count = self._semantic.count()
+        if count == 0:
+            return []
+
+        embedding = await self._embed(query)
+        if embedding is None:
+            return []
+
+        try:
+            results = self._semantic.query(
+                query_embeddings=[embedding],
+                n_results=min(n * 2, count),
+                include=["documents", "metadatas", "distances"],
+            )
+            docs  = results["documents"][0]
+            metas = results["metadatas"][0]
+            dists = results["distances"][0]
+
+            output = []
+            for doc, meta, dist in zip(docs, metas, dists):
+                conf = float(meta.get("confidence", 0.0))
+                if conf >= min_confidence:
+                    output.append({
+                        "text":       doc,
+                        "source":     meta.get("source", ""),
+                        "confidence": conf,
+                        "score":      round(1.0 - dist, 3),
+                    })
+            return output[:n]
+        except Exception as e:
+            logger.error(f"[Memory] get_semantic error: {e}")
+            return []
+
+    # ─── Working memory (active) ──────────────────────────────────────────────
+
+    async def set_active(self, key: str, value: str, ttl_minutes: int = 60):
+        """Working memory : contexte immédiat avec TTL."""
+        if not self._chroma_ok or self._active is None:
+            return
+
+        # Nettoyer les entrées expirées avant d'insérer
+        now_iso = datetime.now().isoformat()
+        try:
+            all_entries = self._active.get(include=["metadatas"])
+            ids_to_delete = [
+                entry_id
+                for entry_id, meta in zip(
+                    all_entries.get("ids", []),
+                    all_entries.get("metadatas", [])
+                )
+                if meta.get("expires_at", "") < now_iso
+            ]
+            if ids_to_delete:
+                self._active.delete(ids=ids_to_delete)
+        except Exception as e:
+            logger.warning(f"[Memory] set_active cleanup error: {e}")
+
+        embedding = await self._embed(f"{key}: {value}")
+        if embedding is None:
+            return
+
+        expires_at = datetime.fromtimestamp(
+            time.time() + ttl_minutes * 60
+        ).isoformat()
+        doc_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+        try:
+            self._active.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[f"{key}: {value}"],
+                metadatas=[{
+                    "key":        key,
+                    "value":      value,
+                    "expires_at": expires_at,
+                }],
+            )
+        except Exception as e:
+            logger.error(f"[Memory] set_active error: {e}")
+
+    async def get_active(self, key: str) -> Optional[str]:
+        """Récupère une valeur de la working memory si pas expirée."""
+        if not self._chroma_ok or self._active is None:
+            return None
+
+        doc_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+        try:
+            result = self._active.get(ids=[doc_id], include=["metadatas"])
+            if not result["ids"]:
+                return None
+            meta = result["metadatas"][0]
+            expires_at = meta.get("expires_at", "")
+            if expires_at < datetime.now().isoformat():
+                self._active.delete(ids=[doc_id])
+                return None
+            return meta.get("value")
+        except Exception as e:
+            logger.error(f"[Memory] get_active error: {e}")
+            return None
+
+    # ─── Contexte complet pour une requête ────────────────────────────────────
+
+    async def get_full_context(self, query: str) -> dict:
+        """
+        Retourne le contexte complet pour une requête:
+        {
+          episodic: [...],    # 3 épisodes pertinents
+          semantic: [...],    # 5 faits/règles pertinents (confidence >= 0.6)
+          procedural: [...],  # 3 séquences réussies similaires
+          active: {...},      # working memory courante
+        }
+        Utilisé par agent.py pour enrichir le contexte de chaque requête.
+        """
+        # Exécuter les 3 recherches en parallèle
+        episodic_task   = asyncio.create_task(self.search(query, n_results=3))
+        semantic_task   = asyncio.create_task(self.get_semantic(query, min_confidence=0.6, n=5))
+        procedural_task = asyncio.create_task(self.get_procedural(query, n=3))
+
+        episodic_results, semantic_results, procedural_results = await asyncio.gather(
+            episodic_task, semantic_task, procedural_task
+        )
+
+        # Lire toute la working memory active non expirée
+        active_data = {}
+        if self._chroma_ok and self._active is not None:
+            try:
+                now_iso = datetime.now().isoformat()
+                all_entries = self._active.get(include=["metadatas"])
+                for meta in all_entries.get("metadatas", []):
+                    if meta.get("expires_at", "") >= now_iso:
+                        active_data[meta["key"]] = meta["value"]
+            except Exception as e:
+                logger.warning(f"[Memory] get_full_context active error: {e}")
+
+        return {
+            "episodic":   episodic_results,
+            "semantic":   semantic_results,
+            "procedural": procedural_results,
+            "active":     active_data,
+        }
+
     # ─── Stats ────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
@@ -547,3 +796,6 @@ class RucheMemory:
 
 # ─── Instance globale (importée par les outils et l'agent) ────────────────────
 # Usage: from memory import RucheMemory; mem = RucheMemory(); await mem.initialize()
+
+# Alias pour compatibilité avec l'import de l'agent
+Memory = RucheMemory

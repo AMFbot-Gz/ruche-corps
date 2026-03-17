@@ -863,6 +863,32 @@ async def self_repair_file(file_path: str, error_description: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# MÉTACOGNITION & AUTONOMIE
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Déclencher une réflexion immédiate sur les performances du jour", "system")
+async def reflect_now() -> str:
+    """Lance une analyse des missions du jour et génère des règles d'amélioration."""
+    from core.metacognition import get_metacognition
+    meta = get_metacognition()
+    return await meta.reflect_now()
+
+
+@tool("Voir et modifier les niveaux d'autonomie par catégorie", "system")
+async def autonomy_config(category: str = "", level: int = 0) -> str:
+    """
+    category: catégorie à modifier (vide = afficher tout)
+    level: niveau 1-5 (0 = afficher seulement)
+    """
+    from core.autonomy import get_autonomy
+    mgr = get_autonomy()
+    if category and 1 <= level <= 5:
+        mgr.set_level(category, level)
+        return f"✅ {category} → niveau {level}"
+    return mgr.summary()
+
+
+# ═══════════════════════════════════════════════════════════════
 # ÉTAT DU MONDE
 # ═══════════════════════════════════════════════════════════════
 
@@ -905,3 +931,28 @@ async def world_state() -> str:
         f"World state: ~/.ruche/world_state.json (mis à jour)",
     ]
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SWARM — Délégation aux agents spécialistes
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Déléguer une tâche complexe au swarm d'agents spécialistes en parallèle", "swarm")
+async def delegate_to_swarm(task: str, specialist: str = "auto") -> str:
+    """
+    task: description complète de la tâche à déléguer
+    specialist: 'auto' (Queen décide), ou 'code'/'web'/'file'/'memory'/'computer'
+    """
+    from swarm.queen import get_queen
+    from swarm.specialists import SPECIALISTS
+
+    if specialist != "auto" and specialist in SPECIALISTS:
+        # Délégation directe au spécialiste demandé
+        agent  = SPECIALISTS[specialist]
+        result = await agent.execute(task)
+        return f"[{specialist.upper()}] {result}"
+    else:
+        # Queen coordonne
+        queen  = get_queen()
+        result = await queen.execute(task)
+        return f"[SWARM] {result}"

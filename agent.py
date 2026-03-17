@@ -11,6 +11,7 @@ Architecture Claude :
 """
 import asyncio
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -23,6 +24,7 @@ from config import CFG
 from core.logger import get_logger
 from core.resilience import get_ollama_client, CircuitOpenError
 from core.schemas import InboundMessage
+from core.thinking import get_thinking_layer
 from memory import Memory
 from router import Router
 from tools.registry import registry
@@ -73,12 +75,14 @@ DATE/HEURE : {dt}
 
 class RucheAgent:
     def __init__(self):
-        self.redis    = None
-        self.memory   = Memory()
-        self.router   = Router()
-        self.ctx      = ContextBuilder()
+        self.redis          = None
+        self.memory         = Memory()
+        self.router         = Router()
+        self.ctx            = ContextBuilder()
         # _http conservé pour les appels non-Ollama (streaming, etc.)
-        self._http    = httpx.AsyncClient(timeout=180.0)
+        self._http          = httpx.AsyncClient(timeout=180.0)
+        self._thinking      = get_thinking_layer()
+        self._autonomy_level = int(os.getenv("AUTONOMY_LEVEL", "3"))
         import tools.builtins  # enregistrement @tool
 
     # ── Démarrage ─────────────────────────────────────────────
@@ -157,6 +161,19 @@ class RucheAgent:
         # Historique session
         history = await self._history_get(sid)
 
+        # Passe de raisonnement silencieux (ThinkingLayer, M_FAST, non-bloquant)
+        thought = await self._thinking.think(text, context_summary=mem_text[:300])
+
+        # Injection de l'analyse interne dans le system prompt
+        thinking_injection = thought.to_system_injection()
+
+        # Avertissement si confiance basse (niveau autonomie 3 par défaut)
+        if self._thinking.should_ask_confirmation(thought, self._autonomy_level):
+            thinking_injection += (
+                "\n\nTa confiance est basse. "
+                "Si tu as un doute, demande confirmation avant une action irréversible."
+            )
+
         # System prompt avec Nemotron
         system = SYSTEM.format(
             name=CFG.NAME,
@@ -165,13 +182,23 @@ class RucheAgent:
             tools=", ".join(registry.list_tools()),
             dt=datetime.now().strftime("%A %d %B %Y — %H:%M"),
             context=context_block,
-        )
+        ) + f"\n\n{thinking_injection}"
 
         messages = history + [{"role": "user", "content": text}]
-        answer   = await self._loop(model, system, messages, sid)
+        answer, tool_calls_used = await self._loop(model, system, messages, sid)
 
-        # Persistance
+        # Persistance de l'épisode
         await self.memory.save(sid, text, answer)
+
+        # Mémorisation procédurale de la séquence réussie
+        if tool_calls_used:
+            await self.memory.store_procedural(
+                task=text,
+                tool_sequence=[tc["name"] for tc in tool_calls_used],
+                result=answer[:200],
+                success=True,
+                confidence=thought.confidence,
+            )
         await self._history_set(sid, text, answer)
 
         ms = (time.monotonic() - t0) * 1000
@@ -192,7 +219,7 @@ class RucheAgent:
 
     # ── Boucle ReAct LLM ↔ Outils ────────────────────────────
     async def _loop(self, model: str, system: str, messages: list,
-                    sid: str, max_iter: int = 15) -> str:
+                    sid: str, max_iter: int = 15) -> tuple[str, list]:
         tools = registry.get_schemas()
         msgs  = messages.copy()
 
@@ -206,6 +233,9 @@ class RucheAgent:
             options["num_ctx"] = CFG.NEMOTRON_CTX
 
         ollama = get_ollama_client()
+
+        # Accumulation de tous les tool_calls utilisés dans la session
+        all_tool_calls: list[dict] = []
 
         for i in range(max_iter):
             payload = {
@@ -244,16 +274,19 @@ class RucheAgent:
                             })
             except CircuitOpenError as e:
                 log.error("llm_circuit_open", iter=i, session_id=sid, error=str(e))
-                return f"Service IA temporairement indisponible: {e}"
+                return f"Service IA temporairement indisponible: {e}", all_tool_calls
             except Exception as e:
                 log.error("llm_error", iter=i, session_id=sid, error=str(e))
                 if content:
-                    return content.strip()
-                return f"Erreur de connexion au modèle: {e}"
+                    return content.strip(), all_tool_calls
+                return f"Erreur de connexion au modèle: {e}", all_tool_calls
 
             # Pas d'outils → réponse finale
             if not tool_calls:
-                return content.strip() or "Réponse vide du modèle."
+                return content.strip() or "Réponse vide du modèle.", all_tool_calls
+
+            # Accumuler les tool_calls pour la mémoire procédurale
+            all_tool_calls.extend(tool_calls)
 
             # Exécution parallèle des outils
             names = [tc["name"] for tc in tool_calls]
@@ -273,7 +306,7 @@ class RucheAgent:
                     "content": json.dumps(res, ensure_ascii=False)[:4000],
                 })
 
-        return content.strip() or "Impossible de terminer après plusieurs tentatives."
+        return content.strip() or "Impossible de terminer après plusieurs tentatives.", all_tool_calls
 
     # ── Historique Redis TTL 2h ────────────────────────────────
     async def _history_get(self, sid: str) -> list:

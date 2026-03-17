@@ -417,6 +417,11 @@ class GoalsLoop:
         # Générer des objectifs au démarrage
         await self.generate_goals()
 
+        # Déclencher réflexion si c'est le premier cycle après 3h00
+        from core.metacognition import get_metacognition
+        meta = get_metacognition()
+        asyncio.create_task(meta.schedule())  # Lance en background
+
         while True:
             try:
                 # Génération automatique toutes les 6h

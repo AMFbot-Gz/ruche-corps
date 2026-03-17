@@ -16,8 +16,11 @@ import httpx
 import redis.asyncio as aioredis
 
 from config import CFG
+from core.logger import get_logger
 from missions.planner import update_plan, replan_task
 from tools.registry import registry
+
+log = get_logger("executor")
 
 # Nombre max de tentatives par tâche avant abandon
 MAX_RETRIES    = 2
@@ -207,6 +210,18 @@ class MissionExecutor:
                                 "name":      fn.get("name", ""),
                                 "arguments": fn.get("arguments", {}),
                             })
+
+            # Vérification post-condition pour chaque outil appelé
+            from core.verifier import get_verifier
+            verifier = get_verifier()
+            for tc in tool_calls:
+                v_result = await verifier.verify(tc["name"], tc["arguments"], content)
+                if not v_result.success:
+                    log.warning("tool_verification_failed",
+                                tool=tc["name"],
+                                reason=v_result.message)
+                    # Ajouter l'échec de vérification dans le résultat
+                    content = f"ERREUR (vérification): {v_result.message} | LLM disait: {content[:100]}"
 
             # Exécuter les outils si demandés
             if tool_calls:
