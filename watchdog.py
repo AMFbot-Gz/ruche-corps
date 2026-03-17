@@ -29,6 +29,9 @@ import psutil
 import redis.asyncio as aioredis
 
 from config import CFG
+from core.logger import get_logger
+
+log = get_logger(__name__)
 
 # ─── Configuration des services surveillés ────────────────────────────────────
 DIR = Path(__file__).parent.resolve()
@@ -374,16 +377,20 @@ class Watchdog:
             print("[Watchdog] Ollama : OK")
 
         # Mémoire
-        if not self.check_memory():
+        mem_ok = self.check_memory()
+        if not mem_ok:
             mem_pct = psutil.virtual_memory().percent
+            log.warning("high_memory_usage", percent=mem_pct)
             await self._alert(f"[Watchdog] ALERTE : RAM à {mem_pct:.1f}% (seuil {_MEM_THRESHOLD}%)")
             print(f"[Watchdog] Mémoire : CRITIQUE ({mem_pct:.1f}%)")
         else:
             print(f"[Watchdog] Mémoire : OK ({psutil.virtual_memory().percent:.1f}%)")
 
         # Disque (pourcentage)
-        if not self.check_disk():
+        disk_ok = self.check_disk()
+        if not disk_ok:
             disk_pct = psutil.disk_usage("/").percent
+            log.warning("low_disk_space", percent=disk_pct)
             await self._alert(f"[Watchdog] ALERTE : Disque à {disk_pct:.1f}% (seuil {_DISK_THRESHOLD}%)")
             print(f"[Watchdog] Disque : CRITIQUE ({disk_pct:.1f}%)")
         else:

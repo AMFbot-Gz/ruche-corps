@@ -17,7 +17,8 @@ import httpx
 from config import CFG
 
 SCREEN_PATH = Path("/tmp/ruche_screen.png")
-_last_hash  = ""
+# Encapsulé dans un dict pour éviter le rebinding du module global
+_state = {"last_hash": ""}
 
 
 def screenshot(region: Optional[str] = None) -> Path:
@@ -73,15 +74,14 @@ async def see(question: str = "Décris ce que tu vois sur l'écran en détail.")
     Screenshot + analyse vision.
     Retourne { description, changed, screenshot_b64, timestamp }
     """
-    global _last_hash
     try:
         path = screenshot()
     except Exception as e:
         return {"error": str(e), "description": "", "changed": False}
 
     new_hash = _hash(path)
-    changed  = new_hash != _last_hash
-    _last_hash = new_hash
+    changed  = new_hash != _state["last_hash"]
+    _state["last_hash"] = new_hash
 
     # Compression avant envoi au LLM vision (limite la charge réseau)
     img_b64  = screenshot_compressed(max_width=1280)

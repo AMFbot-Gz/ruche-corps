@@ -50,7 +50,7 @@ class SpecialistAgent:
         self,
         name: str,
         role: str,
-        allowed_tools: list,
+        allowed_tools: list[str],
         model: str = "",
         max_iter: int = 8,
     ):
@@ -162,7 +162,7 @@ class SpecialistAgent:
 
     # ── Méthodes internes ─────────────────────────────────────────────
 
-    async def _call_llm(self, messages: list, tools: list) -> tuple[str, list]:
+    async def _call_llm(self, messages: list[dict], tools: list[dict]) -> tuple[str, list[dict]]:
         """
         Appel Ollama avec les outils du spécialiste.
         Utilise httpx async context manager (pas de leak).

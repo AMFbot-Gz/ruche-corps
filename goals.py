@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import psutil
@@ -185,7 +185,7 @@ class GoalsLoop:
             )
             conn.commit()
 
-    def list_goals(self) -> list:
+    def list_goals(self) -> list["Goal"]:
         """Retourne tous les objectifs actifs ou en attente."""
         with self._get_conn() as conn:
             rows = conn.execute(
@@ -193,7 +193,7 @@ class GoalsLoop:
             ).fetchall()
         return [Goal.from_row(r) for r in rows]
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> dict[str, Any]:
         """Retourne les statistiques d'exécution."""
         with self._get_conn() as conn:
             total   = conn.execute("SELECT COUNT(*) FROM goals").fetchone()[0]

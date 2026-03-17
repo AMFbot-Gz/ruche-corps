@@ -38,9 +38,13 @@ class MissionQueue:
             "status":     "queued",
         }, ensure_ascii=False)
         await self._redis.rpush(QUEUE_KEY, payload)
-        # Backup fichier
-        with open(BACKUP_FILE, "a") as f:
-            f.write(payload + "\n")
+        # Backup fichier (non-critique : l'échec ne bloque pas la mission)
+        try:
+            BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(BACKUP_FILE, "a") as f:
+                f.write(payload + "\n")
+        except Exception:
+            pass
         return mid
 
     async def pop(self) -> Optional[dict]:

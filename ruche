@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""
+ruche — CLI de La Ruche
+Usage:
+  ./ruche start    [--goals] [--no-voice]
+  ./ruche stop
+  ./ruche restart
+  ./ruche status
+  ./ruche logs     [agent|worker|watchdog|goals] [--follow|-f]
+  ./ruche mission  "description de la mission"
+  ./ruche models   — lister les modèles disponibles
+  ./ruche health   — check rapide de tous les services
+"""
+
+import sys
+import os
+import subprocess
+import signal
+import time
+import json
+import urllib.request
+from pathlib import Path
+from datetime import datetime, timezone
+
+DIR = Path(__file__).parent.resolve()
+RUCHE_DIR = Path.home() / ".ruche"
+LOGS_DIR = RUCHE_DIR / "logs"
+
+# Couleurs ANSI
+BOLD  = "\033[1m"
+GREEN = "\033[0;32m"
+RED   = "\033[0;31m"
+YELLOW= "\033[1;33m"
+BLUE  = "\033[0;34m"
+CYAN  = "\033[0;36m"
+DIM   = "\033[2m"
+RESET = "\033[0m"
+
+SERVICES = {
+    "worker":   {"pid": DIR / ".worker.pid",   "log": LOGS_DIR / "worker.log"},
+    "watchdog": {"pid": DIR / ".watchdog.pid", "log": LOGS_DIR / "watchdog.log"},
+    "goals":    {"pid": DIR / ".goals.pid",    "log": LOGS_DIR / "goals.log"},
+    "agent":    {"pid": DIR / ".agent.pid",    "log": LOGS_DIR / "agent.log"},
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# Utilitaires
+# ─────────────────────────────────────────────────────────────
+
+def _read_pid(pid_file: Path) -> int | None:
+    """Lit un PID depuis un fichier, retourne None si invalide."""
+    try:
+        pid = int(pid_file.read_text().strip())
+        # Vérifier que le process existe réellement
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def _uptime(pid: int) -> str:
+    """Retourne l'uptime d'un process sous forme lisible."""
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        elapsed = time.time() - proc.create_time()
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = int(elapsed % 60)
+        if h > 0:
+            return f"{h}h{m:02d}m"
+        elif m > 0:
+            return f"{m}m{s:02d}s"
+        else:
+            return f"{s}s"
+    except Exception:
+        return "?"
+
+
+def _http_get(url: str, timeout: int = 3) -> dict | None:
+    """GET JSON, retourne None si inaccessible."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _tail_log(log_file: Path, n: int = 3) -> list[str]:
+    """Retourne les n dernières lignes d'un fichier de log."""
+    if not log_file.exists():
+        return []
+    try:
+        result = subprocess.run(
+            ["tail", "-n", str(n), str(log_file)],
+            capture_output=True, text=True, timeout=5
+        )
+        return [line for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def _redis_ping() -> bool:
+    """Vérifie si Redis répond."""
+    try:
+        import redis as redis_lib
+        r = redis_lib.Redis(host="localhost", port=6379, socket_timeout=2)
+        return r.ping()
+    except Exception:
+        pass
+    # Fallback via subprocess redis-cli
+    try:
+        result = subprocess.run(
+            ["redis-cli", "-p", "6379", "ping"],
+            capture_output=True, text=True, timeout=3
+        )
+        return result.stdout.strip() == "PONG"
+    except Exception:
+        return False
+
+
+def _redis_queue_len(queue_name: str = "missions") -> int | None:
+    """Retourne la longueur d'une liste Redis."""
+    try:
+        import redis as redis_lib
+        r = redis_lib.Redis(host="localhost", port=6379, socket_timeout=2)
+        return r.llen(queue_name)
+    except Exception:
+        return None
+
+
+def _chroma_count() -> int:
+    """Nombre de documents dans ChromaDB."""
+    try:
+        import chromadb
+        chroma_path = str(RUCHE_DIR / "memory" / "chroma")
+        client = chromadb.PersistentClient(path=chroma_path)
+        total = 0
+        for col in client.list_collections():
+            total += col.count()
+        return total
+    except Exception:
+        return 0
+
+
+def _active_model() -> str:
+    """Modèle actif depuis config.py."""
+    try:
+        sys.path.insert(0, str(DIR))
+        from config import CFG
+        return CFG.M_GENERAL
+    except Exception:
+        return "?"
+
+
+def _tool_count() -> int:
+    """Nombre d'outils dans le registre."""
+    try:
+        sys.path.insert(0, str(DIR))
+        from tools.registry import registry
+        return len(registry.list_tools())
+    except Exception:
+        return 0
+
+
+def _docker_container_running(name: str) -> bool:
+    """Vérifie si un conteneur Docker tourne."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", name],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+# Commandes
+# ─────────────────────────────────────────────────────────────
+
+def cmd_start(args: list[str]) -> None:
+    """Lance tous les services via start.sh."""
+    start_script = DIR / "start.sh"
+    if not start_script.exists():
+        print(f"{RED}❌ start.sh introuvable dans {DIR}{RESET}")
+        sys.exit(1)
+    extra = []
+    if "--goals" in args:
+        extra.append("--goals")
+    if "--no-voice" in args:
+        extra.append("--no-voice")
+    os.execv("/bin/bash", ["/bin/bash", str(start_script)] + extra)
+
+
+def cmd_stop() -> None:
+    """Arrête tous les services proprement."""
+    print(f"\n{BOLD}⏹  Arrêt de La Ruche...{RESET}")
+    stopped = 0
+    for name, cfg in SERVICES.items():
+        pid_file = cfg["pid"]
+        pid = _read_pid(pid_file)
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                pid_file.unlink(missing_ok=True)
+                print(f"  {GREEN}✅ {name:<10}{RESET} arrêté (PID {pid})")
+                stopped += 1
+            except ProcessLookupError:
+                pid_file.unlink(missing_ok=True)
+                print(f"  {DIM}ℹ️  {name:<10} déjà arrêté{RESET}")
+        else:
+            if pid_file.exists():
+                pid_file.unlink(missing_ok=True)
+            print(f"  {DIM}ℹ️  {name:<10} non actif{RESET}")
+    print(f"\n{GREEN}✅ {stopped} service(s) arrêté(s){RESET}\n")
+
+
+def cmd_status() -> None:
+    """Affiche l'état complet en temps réel."""
+    print("")
+    print("╔═══════════════════════════════════════════╗")
+    print("║       LA RUCHE — STATUT                   ║")
+    print("╚═══════════════════════════════════════════╝")
+
+    # ── Services Python ──────────────────────────────────────
+    print(f"\n{BOLD}SERVICES{RESET}")
+
+    service_lines = []
+    for name in ["agent", "worker", "watchdog", "goals"]:
+        cfg = SERVICES[name]
+        pid = _read_pid(cfg["pid"])
+        if pid is not None:
+            uptime = _uptime(pid)
+            extra = ""
+            # Infos supplémentaires selon le service
+            if name == "worker":
+                n = _redis_queue_len("missions")
+                extra = f"  | {n if n is not None else '?'} missions en attente"
+            elif name == "goals":
+                n = _redis_queue_len("goals")
+                extra = f"  | {n if n is not None else '?'} objectifs en attente"
+            line = (f"  {GREEN}✅ {name.capitalize():<10}{RESET}"
+                    f" PID {pid:<7} uptime: {uptime}{extra}")
+        else:
+            line = f"  {RED}❌ {name.capitalize():<10}{RESET} {DIM}non actif{RESET}"
+        service_lines.append(line)
+        print(line)
+
+    # ── Infrastructure ───────────────────────────────────────
+    print(f"\n{BOLD}INFRASTRUCTURE{RESET}")
+
+    # Redis
+    if _redis_ping():
+        print(f"  {GREEN}✅ Redis      {RESET} localhost:6379")
+    else:
+        print(f"  {RED}❌ Redis      {RESET} {DIM}inaccessible{RESET}")
+
+    # Ollama
+    ollama_data = _http_get("http://localhost:11434/api/tags")
+    if ollama_data is not None:
+        model_count = len(ollama_data.get("models", []))
+        print(f"  {GREEN}✅ Ollama     {RESET} localhost:11434  | {model_count} modèle(s)")
+    else:
+        print(f"  {RED}❌ Ollama     {RESET} {DIM}inaccessible{RESET}")
+
+    # Postgres (Docker)
+    if _docker_container_running("revenue-os-postgres"):
+        print(f"  {GREEN}✅ Postgres   {RESET} revenue-os-postgres (Docker)")
+    else:
+        # Vérifier un conteneur postgres générique
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "--filter", "ancestor=postgres", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=5
+            )
+            pg_containers = result.stdout.strip().splitlines()
+            if pg_containers:
+                print(f"  {GREEN}✅ Postgres   {RESET} {pg_containers[0]} (Docker)")
+            else:
+                print(f"  {DIM}⚪ Postgres   {RESET} {DIM}non actif (optionnel){RESET}")
+        except Exception:
+            print(f"  {DIM}⚪ Postgres   {RESET} {DIM}non actif (optionnel){RESET}")
+
+    # N8N
+    n8n_data = _http_get("http://localhost:5678/healthz")
+    if n8n_data is not None or _http_get("http://localhost:5678") is not None:
+        print(f"  {GREEN}✅ N8N        {RESET} localhost:5678")
+    else:
+        print(f"  {DIM}⚪ N8N        {RESET} {DIM}non actif (optionnel){RESET}")
+
+    # ── Agent ────────────────────────────────────────────────
+    print(f"\n{BOLD}AGENT{RESET}")
+
+    model = _active_model()
+    tool_count = _tool_count()
+    memory_count = _chroma_count()
+
+    print(f"  {CYAN}🤖 Modèle:{RESET}   {model}")
+    print(f"  {CYAN}🔧 Outils:{RESET}   {tool_count}")
+    print(f"  {CYAN}💾 Mémoire:{RESET}  {memory_count} souvenirs ChromaDB")
+
+    # ── Logs récents ─────────────────────────────────────────
+    print(f"\n{BOLD}LOGS RÉCENTS (agent){RESET}")
+    agent_log = SERVICES["agent"]["log"]
+    recent_lines = _tail_log(agent_log, n=3)
+    if recent_lines:
+        for line in recent_lines:
+            # Troncature si trop long
+            if len(line) > 100:
+                line = line[:97] + "..."
+            print(f"  {DIM}{line}{RESET}")
+    else:
+        print(f"  {DIM}(aucun log — {agent_log}){RESET}")
+
+    print("")
+
+
+def cmd_health() -> None:
+    """Check rapide de tous les services."""
+    print(f"\n{BOLD}LA RUCHE — HEALTH CHECK{RESET}\n")
+
+    checks = []
+
+    # Redis
+    ok = _redis_ping()
+    checks.append(("Redis       ", ok, "localhost:6379", ""))
+
+    # Ollama
+    ollama_data = _http_get("http://localhost:11434/api/tags")
+    ok = ollama_data is not None
+    detail = f"{len(ollama_data.get('models', []))} modèles" if ok else ""
+    checks.append(("Ollama      ", ok, "localhost:11434", detail))
+
+    # N8N
+    n8n_ok = (_http_get("http://localhost:5678/healthz") is not None
+              or _http_get("http://localhost:5678") is not None)
+    checks.append(("N8N         ", n8n_ok, "localhost:5678", ""))
+
+    # Ghost OS
+    ghost_ok = _http_get("http://localhost:3000/api/health") is not None
+    checks.append(("Ghost OS    ", ghost_ok, "localhost:3000", ""))
+
+    # Services Python
+    for name in ["agent", "worker", "watchdog", "goals"]:
+        pid = _read_pid(SERVICES[name]["pid"])
+        ok_svc = pid is not None
+        detail = f"PID {pid}" if ok_svc else ""
+        checks.append((f"{name.capitalize():<12}", ok_svc, "", detail))
+
+    # Affichage
+    all_ok = True
+    for label, ok, addr, detail in checks:
+        icon = f"{GREEN}✅{RESET}" if ok else f"{RED}❌{RESET}"
+        addr_str = f" {DIM}{addr}{RESET}" if addr else ""
+        detail_str = f"  {CYAN}{detail}{RESET}" if detail else ""
+        print(f"  {icon} {label}{addr_str}{detail_str}")
+        if not ok:
+            all_ok = False
+
+    if all_ok:
+        print(f"\n{GREEN}{BOLD}✅ Tout est opérationnel{RESET}\n")
+    else:
+        print(f"\n{YELLOW}⚠️  Certains services sont inactifs{RESET}\n")
+
+
+def cmd_logs(service: str = "agent", follow: bool = False) -> None:
+    """Affiche les logs d'un service."""
+    svc = SERVICES.get(service)
+    if svc is None:
+        print(f"{RED}❌ Service inconnu: {service}{RESET}")
+        print(f"Services disponibles: {', '.join(SERVICES.keys())}")
+        sys.exit(1)
+    log_file = svc["log"]
+    if not log_file.exists():
+        print(f"{YELLOW}⚠️  Fichier de log inexistant: {log_file}{RESET}")
+        print(f"  (Le service {service} n'a peut-être jamais été lancé)")
+        return
+    if follow:
+        os.execv("/usr/bin/tail", ["tail", "-f", "-n", "50", str(log_file)])
+    else:
+        os.execv("/usr/bin/tail", ["tail", "-n", "100", str(log_file)])
+
+
+def cmd_mission(text: str) -> None:
+    """Soumet une mission au worker."""
+    worker_script = DIR / "worker.py"
+    if not worker_script.exists():
+        print(f"{RED}❌ worker.py introuvable{RESET}")
+        sys.exit(1)
+    result = subprocess.run(
+        [sys.executable, str(worker_script), "--add", text],
+        cwd=str(DIR)
+    )
+    sys.exit(result.returncode)
+
+
+def cmd_models() -> None:
+    """Liste les modèles Ollama disponibles."""
+    data = _http_get("http://localhost:11434/api/tags")
+    if data is None:
+        print(f"{RED}❌ Ollama inaccessible (localhost:11434){RESET}")
+        sys.exit(1)
+    models = [m["name"] for m in data.get("models", [])]
+    if not models:
+        print(f"{YELLOW}⚠️  Aucun modèle installé{RESET}")
+        print(f"  Installer: ollama pull llama3.2:3b")
+        return
+    print(f"\n{BOLD}🤖 {len(models)} modèle(s) disponible(s):{RESET}")
+    for m in sorted(models):
+        print(f"  • {m}")
+    print("")
+
+
+# ─────────────────────────────────────────────────────────────
+# Point d'entrée
+# ─────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+
+    cmd = args[0]
+    rest = args[1:]
+
+    if cmd == "start":
+        cmd_start(rest)
+
+    elif cmd == "stop":
+        cmd_stop()
+
+    elif cmd == "restart":
+        cmd_stop()
+        time.sleep(2)
+        cmd_start(rest)
+
+    elif cmd == "status":
+        cmd_status()
+
+    elif cmd == "logs":
+        # Chercher le nom du service parmi les arguments non-flags
+        svc = next((a for a in rest if not a.startswith("-")), "agent")
+        follow = "--follow" in rest or "-f" in rest
+        cmd_logs(svc, follow=follow)
+
+    elif cmd == "mission":
+        if not rest:
+            print(f"{RED}❌ Précise une mission: ./ruche mission \"texte\"{RESET}")
+            sys.exit(1)
+        cmd_mission(" ".join(rest))
+
+    elif cmd == "models":
+        cmd_models()
+
+    elif cmd == "health":
+        cmd_health()
+
+    else:
+        print(f"{RED}❌ Commande inconnue: {cmd}{RESET}")
+        print(f"Usage: ./ruche [start|stop|restart|status|logs|mission|models|health]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -15,6 +15,7 @@ import os
 import re
 import time
 from datetime import datetime
+from typing import Any
 
 import httpx
 import redis.asyncio as aioredis
@@ -99,6 +100,9 @@ class RucheAgent:
                  model=CFG.M_GENERAL,
                  ctx_k=CFG.NEMOTRON_CTX // 1000,
                  channel=CFG.CH_IN)
+        # Auto-configuration des modèles Ollama disponibles (non-bloquant)
+        from core.model_selector import auto_configure_models
+        asyncio.create_task(auto_configure_models())
         async with self.redis.pubsub() as ps:
             await ps.subscribe(CFG.CH_IN)
             async for msg in ps.listen():
@@ -148,6 +152,12 @@ class RucheAgent:
         facts_ctx = await self.memory.search_facts(text, n=2)
         mem_text  = "\n".join(filter(None, [mem_ctx, facts_ctx])) or ""
 
+        # Lancer la pensée silencieuse en parallèle dès qu'on a le contexte mémoire
+        # → ne bloque pas la préparation du contexte et de l'historique
+        think_task = asyncio.create_task(
+            self._thinking.think(text, context_summary=mem_text[:300])
+        )
+
         # Context builder — auto-détection des fichiers pertinents
         file_ctx = ""
         if any(kw in text.lower() for kw in ["fichier", "code", "projet", "analyser", "lire", "charger"]):
@@ -161,11 +171,11 @@ class RucheAgent:
         elif mem_text:
             context_block = f"\n📡 MÉMOIRE:\n{mem_text[:1000]}\n"
 
-        # Historique session
+        # Historique session (en parallèle de la pensée)
         history = await self._history_get(sid)
 
-        # Passe de raisonnement silencieux (ThinkingLayer, M_FAST, non-bloquant)
-        thought = await self._thinking.think(text, context_summary=mem_text[:300])
+        # Récupérer la pensée silencieuse au dernier moment (probablement déjà finie)
+        thought = await think_task
 
         # Injection de l'analyse interne dans le system prompt
         thinking_injection = thought.to_system_injection()
@@ -221,8 +231,8 @@ class RucheAgent:
         }))
 
     # ── Boucle ReAct LLM ↔ Outils ────────────────────────────
-    async def _loop(self, model: str, system: str, messages: list,
-                    sid: str, max_iter: int = 15) -> tuple[str, list]:
+    async def _loop(self, model: str, system: str, messages: list[dict[str, Any]],
+                    sid: str, max_iter: int = 15) -> tuple[str, list[dict[str, Any]]]:
         tools = registry.get_schemas()
         msgs  = messages.copy()
 
@@ -312,7 +322,7 @@ class RucheAgent:
         return content.strip() or "Impossible de terminer après plusieurs tentatives.", all_tool_calls
 
     # ── Historique Redis TTL 2h ────────────────────────────────
-    async def _history_get(self, sid: str) -> list:
+    async def _history_get(self, sid: str) -> list[dict[str, Any]]:
         d = await self.redis.get(f"ruche:session:{sid}")
         return json.loads(d)[-20:] if d and d != b"" else []
 

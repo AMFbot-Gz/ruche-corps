@@ -30,6 +30,7 @@ REASON_CODE      = "code"       # 5-30s — écriture / debug de code
 REASON_VISION    = "vision"     # 3-8s  — analyse d'image / écran
 REASON_REASONING = "reasoning"  # 10-30s— problème complexe, math, plan
 REASON_CREATIVE  = "creative"   # 5-15s — écriture, brainstorm
+REASON_SWARM     = "swarm"      # N×Xs  — tâches multiples à exécuter en parallèle
 
 @dataclass
 class RouteDecision:
@@ -44,6 +45,7 @@ class RouteDecision:
 # ─── Règles rapides (pas de LLM, < 1ms) ──────────────────────────────────────
 _FAST_RULES = [
     # (pattern regex, reasoning_type)
+    (r"(en parallèle|simultanément|en même temps|à la fois|plusieurs tâches|multi-|swarm)", REASON_SWARM),
     (r"(quelle|il est|heure|date|jour|mois|année|time|clock)",        REASON_FAST),
     (r"(bonjour|salut|hello|hi\b|hey\b|merci|bonne nuit)",            REASON_FAST),
     (r"(stop|silence|arrête|quit|quitte)",                             REASON_FAST),
@@ -66,6 +68,7 @@ def _type_to_model(reasoning_type: str) -> str:
         REASON_VISION:    CONFIG.M_VISION,
         REASON_REASONING: CONFIG.M_REASON,
         REASON_CREATIVE:  CONFIG.M_GENERAL,
+        REASON_SWARM:     CONFIG.M_GENERAL,
     }.get(reasoning_type, CONFIG.M_GENERAL)
 
 
@@ -73,7 +76,7 @@ def _type_to_model(reasoning_type: str) -> str:
 _ROUTER_PROMPT = """Tu es un classificateur d'intent ultra-rapide.
 Analyse le message et réponds en JSON avec ces champs :
 {
-  "type": "fast|general|code|vision|reasoning|creative",
+  "type": "fast|general|code|vision|reasoning|creative|swarm",
   "priority": 1-5,
   "reason": "explication courte"
 }
@@ -85,6 +88,7 @@ Règles :
 - vision     : analyser une image, un écran, des captures
 - reasoning  : problèmes complexes, math, planification stratégique
 - creative   : écriture, idées, brainstorm
+- swarm      : plusieurs tâches indépendantes à faire en parallèle simultanément
 - priority 5 : urgent (erreur critique, sécurité, panne)
 - priority 1 : info passive, pas besoin de réponse rapide
 

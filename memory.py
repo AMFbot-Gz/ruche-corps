@@ -82,10 +82,24 @@ class RucheMemory:
             total = self._episodes.count() + self._knowledge.count()
             logger.info(f"[Memory] ChromaDB prête — {total} souvenirs chargés.")
             print(f"[Memory] ChromaDB prête — {total} souvenirs chargés.")
+            # Nettoyer les entrées expirées de la working memory au démarrage
+            await self._cleanup_expired_active()
         except Exception as e:
             self._chroma_ok = False
             logger.error(f"[Memory] ChromaDB indisponible: {e} — mode Redis seul activé.")
             print(f"[Memory] ATTENTION: ChromaDB indisponible: {e}")
+
+    async def _cleanup_expired_active(self):
+        """Supprime les entrées expirées de la working memory."""
+        if not self._chroma_ok or self._active is None:
+            return
+        try:
+            now = datetime.now().isoformat()
+            results = self._active.get(where={"expires_at": {"$lt": now}})
+            if results and results.get("ids"):
+                self._active.delete(ids=results["ids"])
+        except Exception:
+            pass
 
     async def _get_redis(self):
         """Connexion Redis lazy (réutilisée)."""

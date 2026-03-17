@@ -16,7 +16,8 @@ from config import CFG
 
 
 # ─── Détection du mode (dev vs prod) ─────────────────────────────────────────
-_DEV = CFG.LOG_LEVEL.upper() == "DEBUG"
+# CFG.DEBUG force le ConsoleRenderer même si LOG_LEVEL != DEBUG
+_DEV = CFG.DEBUG or CFG.LOG_LEVEL.upper() == "DEBUG"
 
 # ─── Configuration logging stdlib (requis par structlog) ──────────────────────
 logging.basicConfig(
