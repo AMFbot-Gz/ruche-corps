@@ -284,9 +284,11 @@ class Watchdog:
                     cwd=str(DIR),
                 )
 
-            # Enregistrer le nouveau PID
+            # Enregistrer le nouveau PID (écriture atomique via fichier temporaire)
             pid_file = Path(cfg["pid_file"])
-            pid_file.write_text(str(proc.pid))
+            tmp = pid_file.with_suffix('.tmp')
+            tmp.write_text(str(proc.pid))
+            os.replace(tmp, pid_file)
 
             self._restarts[service_name]    += 1
             self._last_restart[service_name] = time.time()

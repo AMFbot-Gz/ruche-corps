@@ -179,6 +179,8 @@ class OllamaClient:
                     await asyncio.sleep(wait)
 
         # Toutes les tentatives épuisées
+        if last_exc is None:
+            last_exc = RuntimeError("OllamaClient: toutes les tentatives ont échoué")
         log.error(
             "ollama_all_retries_exhausted",
             attempts=len(self._BACKOFF_DELAYS),

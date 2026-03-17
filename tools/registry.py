@@ -83,7 +83,7 @@ def _build_schema(fn: Callable, description: str) -> dict:
     return {
         "type": "function",
         "function": {
-            "name":        fn.__name__ if not hasattr(fn, "_tool_meta") else fn._tool_meta.name if hasattr(fn, "_tool_meta") else fn.__name__,
+            "name":        fn.__name__,
             "description": description,
             "parameters": {
                 "type":       "object",

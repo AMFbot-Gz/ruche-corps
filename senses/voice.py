@@ -61,7 +61,11 @@ class VoiceSense:
             segs, _ = self._whisper.transcribe(wav_path, language=LANGUAGE, beam_size=5)
             return " ".join(s.text for s in segs).strip()
         finally:
-            os.unlink(wav_path)
+            if 'wav_path' in locals() and wav_path and os.path.exists(wav_path):
+                try:
+                    os.unlink(wav_path)
+                except Exception:
+                    pass
 
     async def _listen_loop(self):
         recognizer = sr.Recognizer()

@@ -205,10 +205,13 @@ Briefing (voix de Jarvis, ton britannique, appelle "{CFG.OWNER}") :"""
 
     # ─── Publication d'alertes sur Redis ─────────────────────────────────
     async def _alert(self, message: str, level: str = "info"):
-        await self._redis.publish(CFG.CH_HB, json.dumps({
-            "type":    "heartbeat_alert",
-            "level":   level,
-            "message": message,
-            "ts":      time.time(),
-        }))
-        log.info("alert_published", level=level, message=message[:80])
+        try:
+            await self._redis.publish(CFG.CH_HB, json.dumps({
+                "type":    "heartbeat_alert",
+                "level":   level,
+                "message": message,
+                "ts":      time.time(),
+            }))
+            log.info("alert_published", level=level, message=message[:80])
+        except Exception as e:
+            print(f"[Heartbeat] ALERT REDIS FAILED: {e} | msg: {message[:100]}")

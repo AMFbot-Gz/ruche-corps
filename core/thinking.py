@@ -91,10 +91,11 @@ class ThinkingLayer:
             context=context[:300] if context else "Aucun contexte récent."
         )
 
+        model = getattr(CFG, 'M_FAST', CFG.M_GENERAL)
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
                 resp = await c.post(f"{CFG.OLLAMA}/api/chat", json={
-                    "model": CFG.M_FAST,  # modèle rapide pour la pensée
+                    "model": model,  # modèle rapide pour la pensée
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                     "options": {"temperature": 0.3, "num_predict": 400},
@@ -116,6 +117,11 @@ class ThinkingLayer:
             confidence=float(data.get("confidence", 0.5)),
         )
 
+        if len(self._cache) >= 200:
+            # Supprimer la moitié la plus ancienne (LRU simple par ordre d'insertion)
+            keys = list(self._cache.keys())
+            for k in keys[:100]:
+                del self._cache[k]
         self._cache[cache_key] = thought
         log.info("thought_generated",
                  intent=thought.intent[:60],

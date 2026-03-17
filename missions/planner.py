@@ -6,6 +6,7 @@ exécutables une par une, avec cache et re-planification sur échec.
 """
 import hashlib
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -78,9 +79,11 @@ def _load_plans() -> dict:
 def _save_plan(plan: dict):
     plans = _load_plans()
     plans[plan["id"]] = plan
-    with open(PLANS_FILE, "w") as f:
+    tmp = PLANS_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
         for p in plans.values():
-            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+            f.write(json.dumps(p, ensure_ascii=False) + '\n')
+    os.replace(tmp, PLANS_FILE)  # atomique sur POSIX
 
 
 async def decompose(

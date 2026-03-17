@@ -163,13 +163,12 @@ class MetacognitionEngine:
         if not db_path.exists():
             return []
         try:
-            conn = sqlite3.connect(str(db_path))
-            rows = conn.execute(
-                "SELECT id, description, status, result, error, learned "
-                "FROM goals WHERE executed_at LIKE ? AND status IN ('done','failed')",
-                (f"{today}%",),
-            ).fetchall()
-            conn.close()
+            with sqlite3.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT id, description, status, result, error, learned "
+                    "FROM goals WHERE executed_at LIKE ? AND status IN ('done','failed')",
+                    (f"{today}%",),
+                ).fetchall()
             return [
                 {
                     "id":          r[0],

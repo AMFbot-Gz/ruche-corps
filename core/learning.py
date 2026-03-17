@@ -241,11 +241,10 @@ class LearningEngine:
             }
 
         try:
-            conn  = sqlite3.connect(str(GOALS_DB))
-            rows  = conn.execute(
-                "SELECT description, status, result, learned FROM goals ORDER BY rowid DESC LIMIT 50"
-            ).fetchall()
-            conn.close()
+            with sqlite3.connect(str(GOALS_DB)) as conn:
+                rows = conn.execute(
+                    "SELECT description, status, result, learned FROM goals ORDER BY rowid DESC LIMIT 50"
+                ).fetchall()
         except Exception as e:
             _log("collect", f"goals.db inaccessible: {e}")
             return {"total": 0, "success_rate": 1.0, "failure_freq": [], "avg_duration": 0.0, "retry_heavy": []}
@@ -422,7 +421,11 @@ class LearningEngine:
         ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name   = proposal.target_file.replace("/", "_")
         backup_path = str(BACKUP_DIR / f"{safe_name}_{ts}.bak")
-        shutil.copy(str(target), backup_path)
+        try:
+            shutil.copy(str(target), backup_path)
+        except Exception as e:
+            log.error("backup_failed_aborting_patch", file=str(target), error=str(e))
+            return False  # abort — pas de backup = pas de patch
         proposal._backup_path = backup_path
 
         # 4b — Syntaxe du nouveau code
@@ -535,13 +538,12 @@ class LearningEngine:
 
         rules_added = 0
         try:
-            conn = sqlite3.connect(str(GOALS_DB))
-            rows = conn.execute(
-                "SELECT description, result FROM goals "
-                "WHERE status='done' AND result IS NOT NULL "
-                "ORDER BY rowid DESC LIMIT 10"
-            ).fetchall()
-            conn.close()
+            with sqlite3.connect(str(GOALS_DB)) as conn:
+                rows = conn.execute(
+                    "SELECT description, result FROM goals "
+                    "WHERE status='done' AND result IS NOT NULL "
+                    "ORDER BY rowid DESC LIMIT 10"
+                ).fetchall()
         except Exception:
             return 0
 

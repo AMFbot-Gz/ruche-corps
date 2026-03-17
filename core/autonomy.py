@@ -86,8 +86,7 @@ class AutonomyManager:
         """
         level = self._levels.get(category, self._levels.get("default", 3))
         # Le niveau global ne peut qu'augmenter la restriction (abaisser le niveau)
-        effective = min(level, self._global_level) if self._global_level < level else level
-        return AutonomyLevel(effective)
+        return AutonomyLevel(min(level, self._global_level))
 
     def set_level(self, category: str, level: int):
         """Modifie le niveau d'autonomie pour une catégorie et persiste."""

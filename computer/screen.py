@@ -18,7 +18,6 @@ from config import CFG
 
 SCREEN_PATH = Path("/tmp/ruche_screen.png")
 _last_hash  = ""
-_http       = httpx.AsyncClient(timeout=30.0)
 
 
 def screenshot(region: Optional[str] = None) -> Path:
@@ -90,19 +89,20 @@ async def see(question: str = "Décris ce que tu vois sur l'écran en détail.")
     # Analyse vision via Ollama
     description = ""
     try:
-        resp = await _http.post(
-            f"{CFG.OLLAMA}/api/chat",
-            json={
-                "model": CFG.M_VISION,
-                "messages": [{
-                    "role": "user",
-                    "content": question,
-                    "images": [img_b64],
-                }],
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 800},
-            },
-        )
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            resp = await c.post(
+                f"{CFG.OLLAMA}/api/chat",
+                json={
+                    "model": CFG.M_VISION,
+                    "messages": [{
+                        "role": "user",
+                        "content": question,
+                        "images": [img_b64],
+                    }],
+                    "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": 800},
+                },
+            )
         description = resp.json().get("message", {}).get("content", "")
     except Exception as e:
         description = f"(vision non disponible: {e})"

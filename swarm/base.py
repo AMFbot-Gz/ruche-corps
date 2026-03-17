@@ -91,6 +91,10 @@ class SpecialistAgent:
         result       = ""
         tool_sequence: list[str] = []
 
+        # Import au niveau de la méthode (avant la boucle) pour éviter
+        # un re-import à chaque itération ReAct
+        from tools.registry import registry
+
         for i in range(self.max_iter):
             content, tool_calls = await self._call_llm(
                 [{"role": "system", "content": system}] + messages,
@@ -108,7 +112,6 @@ class SpecialistAgent:
             log.info("specialist_tools", specialist=self.name, iter=i + 1, tools=names)
 
             # Exécution parallèle des outils via le registry
-            from tools.registry import registry
             exec_results = await registry.execute_parallel(tool_calls)
 
             # Réinjecter dans le contexte

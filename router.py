@@ -127,11 +127,21 @@ class Router:
                 },
             )
             raw = resp.json().get("message", {}).get("content", "{}")
-            # Extraire JSON même si le modèle ajoute du texte
-            m = re.search(r'\{.*\}', raw, re.DOTALL)
-            if m:
+            # Extraire JSON robuste : raw_decode de gauche à droite, prendre le dernier trouvé
+            _decoder = json.decoder.JSONDecoder()
+            _pos = 0
+            _last_data = None
+            while _pos < len(raw):
                 try:
-                    data       = json.loads(m.group())
+                    _obj, _end = _decoder.raw_decode(raw, _pos)
+                    if isinstance(_obj, dict):
+                        _last_data = _obj
+                    _pos = _end
+                except json.JSONDecodeError:
+                    _pos += 1
+            if _last_data is not None:
+                try:
+                    data       = _last_data
                     r_type     = data.get("type", REASON_GENERAL)
                     priority   = int(data.get("priority", 3))
                     explanation = data.get("reason", "")

@@ -405,7 +405,7 @@ class RucheMemory:
                 sum_key = f"ruche:session:{session_id}:summary"
                 summary = await r.get(sum_key)
                 if summary:
-                    parts.append(f"[Résumé session actuelle]\n{summary.decode()}")
+                    parts.append(f"[Résumé session actuelle]\n{summary.decode('utf-8', errors='replace')}")
             except Exception:
                 pass
 

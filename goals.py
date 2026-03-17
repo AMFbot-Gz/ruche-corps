@@ -22,6 +22,9 @@ import psutil
 import redis.asyncio as aioredis
 
 from config import CFG
+from core.logger import get_logger
+
+log = get_logger(__name__)
 
 GOALS_DB = Path.home() / ".ruche" / "goals.db"
 GOALS_DB.parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +277,7 @@ class GoalsLoop:
                 continue
             cat = item.get("category", "general")
             if cat not in valid_cats:
+                log.warning("goal_category_remapped", original=cat, remapped="general")
                 cat = "general"
             self.add_goal(
                 description=item["description"],
@@ -337,9 +341,11 @@ class GoalsLoop:
         self._update_goal(goal)
 
         stats = self.get_stats()
+        rate = stats['success_rate']
+        rate_str = f"{rate}%" if (stats['done'] + stats['failed']) > 0 else "N/A (aucun terminé)"
         print(
             f"[Goals] Objectif {'terminé' if success else 'échoué'}: {goal.id} "
-            f"| succès global: {stats['success_rate']}%"
+            f"| succès global: {rate_str}"
         )
 
     async def _generate_insight(self, goal: Goal, result: str) -> str:
@@ -438,10 +444,12 @@ class GoalsLoop:
                     print("[Goals] Aucun objectif en attente — attente...")
 
                 stats = self.get_stats()
+                rate = stats['success_rate']
+                rate_str = f"{rate}%" if (stats['done'] + stats['failed']) > 0 else "N/A (aucun terminé)"
                 print(
                     f"[Goals] Stats : {stats['done']} terminés / "
                     f"{stats['pending']} en attente / "
-                    f"taux succès {stats['success_rate']}%"
+                    f"taux succès {rate_str}"
                 )
 
             except Exception as e:

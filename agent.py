@@ -103,10 +103,13 @@ class RucheAgent:
             await ps.subscribe(CFG.CH_IN)
             async for msg in ps.listen():
                 if msg["type"] == "message":
+                    raw = msg["data"]
                     try:
-                        asyncio.create_task(self._dispatch(json.loads(msg["data"])))
+                        asyncio.create_task(self._dispatch(json.loads(raw)))
                     except Exception as e:
-                        log.error("dispatch_error", error=str(e))
+                        log.error("dispatch_error",
+                                  error=str(e),
+                                  raw_message=str(raw)[:200])
 
     # ── Dispatch d'un message ─────────────────────────────────
     async def _dispatch(self, data: dict):
@@ -311,7 +314,7 @@ class RucheAgent:
     # ── Historique Redis TTL 2h ────────────────────────────────
     async def _history_get(self, sid: str) -> list:
         d = await self.redis.get(f"ruche:session:{sid}")
-        return json.loads(d)[-20:] if d else []
+        return json.loads(d)[-20:] if d and d != b"" else []
 
     async def _history_set(self, sid: str, user: str, assistant: str):
         h  = await self._history_get(sid)

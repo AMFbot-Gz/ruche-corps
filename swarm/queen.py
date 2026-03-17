@@ -82,6 +82,12 @@ class Queen:
             # Fallback: exécuter directement avec le code_agent
             return await self._fallback_single(task, context)
 
+        # Sécurité : plan invalide ou sans sous-tâches
+        if not plan or "subtasks" not in plan:
+            log.warning("queen_decompose_failed", raw=str(plan)[:200])
+            # Fallback: exécuter la tâche entière avec le spécialiste le plus généraliste
+            return await SPECIALISTS["file"].execute(task, context)
+
         subtasks = plan.get("subtasks", [])
         if not subtasks:
             log.warning("queen_empty_plan", task_preview=task[:80])

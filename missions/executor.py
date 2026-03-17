@@ -215,13 +215,21 @@ class MissionExecutor:
             from core.verifier import get_verifier
             verifier = get_verifier()
             for tc in tool_calls:
-                v_result = await verifier.verify(tc["name"], tc["arguments"], content)
-                if not v_result.success:
-                    log.warning("tool_verification_failed",
-                                tool=tc["name"],
-                                reason=v_result.message)
-                    # Ajouter l'échec de vérification dans le résultat
-                    content = f"ERREUR (vérification): {v_result.message} | LLM disait: {content[:100]}"
+                try:
+                    v_result = await asyncio.wait_for(
+                        verifier.verify(tc["name"], tc["arguments"], content),
+                        timeout=5.0
+                    )
+                    if not v_result.success:
+                        log.warning("tool_verification_failed",
+                                    tool=tc["name"],
+                                    reason=v_result.message)
+                        # Ajouter l'échec de vérification dans le résultat
+                        content = f"ERREUR (vérification): {v_result.message} | LLM disait: {content[:100]}"
+                except asyncio.TimeoutError:
+                    log.warning("verification_timeout", tool=tc["name"])
+                except Exception as e:
+                    log.warning("verification_error", tool=tc["name"], error=str(e))
 
             # Exécuter les outils si demandés
             if tool_calls:

@@ -10,6 +10,8 @@ import json
 import logging
 
 import redis.asyncio as aioredis
+
+log = logging.getLogger("ruche.telegram")
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
@@ -163,17 +165,29 @@ class TelegramSense:
         await self._app.initialize()
         await self._app.start()
         # Retry en cas de conflit (autre instance en cours d'arrêt)
+        polling_started = False
+        last_exc = None
         for attempt in range(10):
             try:
                 await self._app.updater.start_polling(drop_pending_updates=True)
+                polling_started = True
                 break
             except Exception as e:
+                last_exc = e
                 if "Conflict" in str(e) and attempt < 9:
                     print(f"[Telegram] Conflit token (tentative {attempt+1}/10) — attente 8s...")
                     await asyncio.sleep(8)
                 else:
                     print(f"[Telegram] Polling échoué: {e}")
-                    return
+                    break
+        if not polling_started:
+            log.critical(
+                "[Telegram] Impossible de démarrer le polling après 10 tentatives. "
+                f"Dernière erreur: {last_exc}"
+            )
+            raise RuntimeError(
+                f"Telegram polling failed après 10 tentatives: {last_exc}"
+            )
         # Garder en vie
         while True:
             await asyncio.sleep(3600)
