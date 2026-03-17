@@ -36,6 +36,35 @@ def screenshot(region: Optional[str] = None) -> Path:
     return SCREEN_PATH
 
 
+def screenshot_compressed(max_width: int = 1280) -> str:
+    """
+    Capture l'écran et retourne l'image compressée en base64 PNG.
+    Redimensionne à max_width px pour réduire la charge réseau vers le LLM vision.
+    Adapté depuis pico-omni-agentique/vision/analyzer.py (capture_ecran).
+    """
+    try:
+        from PIL import Image
+        import io as _io
+        path = screenshot()
+        img  = Image.open(str(path))
+        w, h = img.size
+        if w > max_width:
+            ratio = max_width / w
+            img   = img.resize((max_width, int(h * ratio)), Image.LANCZOS)
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
+    except ImportError:
+        # Pas de Pillow → fallback lecture directe
+        path = screenshot()
+        return base64.b64encode(path.read_bytes()).decode("utf-8")
+    except Exception:
+        # Dernier recours : lecture brute
+        path = screenshot()
+        return base64.b64encode(path.read_bytes()).decode("utf-8")
+
+
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -55,7 +84,8 @@ async def see(question: str = "Décris ce que tu vois sur l'écran en détail.")
     changed  = new_hash != _last_hash
     _last_hash = new_hash
 
-    img_b64  = base64.b64encode(path.read_bytes()).decode()
+    # Compression avant envoi au LLM vision (limite la charge réseau)
+    img_b64  = screenshot_compressed(max_width=1280)
 
     # Analyse vision via Ollama
     description = ""

@@ -1,6 +1,12 @@
 """
-tools/builtins.py — Arsenal complet de La Ruche (28 outils)
+tools/builtins.py — Arsenal complet de La Ruche (38 outils)
 Tout ce dont un humain spécialiste a besoin pour travailler sur un Mac.
+
+Outils ajoutés (v2) :
+  computer : drag_drop, right_click, screenshot_region
+  system   : parallel_tasks (Kimi-Overdrive pattern avec semaphore)
+  learning : get_learned_rules, self_repair_file
+  memory   : world_state
 """
 import asyncio
 import json
@@ -645,3 +651,257 @@ async def clear_missions() -> str:
         return f"✅ File vidée — {size} mission(s) supprimée(s)"
     except Exception as e:
         return f"❌ Erreur clear missions: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMPUTER USE — OUTILS SUPPLÉMENTAIRES
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Glisser-déposer de (x1,y1) vers (x2,y2)", "computer")
+async def drag_drop(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
+    """
+    x1,y1: position de départ (bouton maintenu)
+    x2,y2: position d'arrivée (relâche)
+    duration: durée du drag en secondes (défaut 0.5)
+    """
+    from computer.input import drag
+    r = await drag(x1, y1, x2, y2, duration=duration)
+    return f"✅ Drag ({x1},{y1}) → ({x2},{y2})" if r["ok"] else f"❌ {r['error']}"
+
+
+@tool("Clic droit sur l'écran", "computer")
+async def right_click(x: int, y: int) -> str:
+    """x: coordonnée X | y: coordonnée Y"""
+    from computer.input import click as _click
+    r = await _click(x, y, button="right")
+    return f"✅ Clic droit ({x},{y})" if r["ok"] else f"❌ {r['error']}"
+
+
+@tool("Capturer une région précise de l'écran et analyser", "computer")
+async def screenshot_region(x: int, y: int, width: int, height: int,
+                             question: str = "Décris cette zone de l'écran.") -> str:
+    """
+    x,y: coin supérieur gauche de la région
+    width,height: dimensions en pixels
+    question: question à poser sur la région capturée
+    """
+    from computer.screen import see
+    region = f"{x},{y},{width},{height}"
+    result = await see(question)
+    if result.get("error"):
+        return f"Erreur vision: {result['error']}"
+    return result.get("description", "(pas de description)")
+
+
+@tool("Appuyer et maintenir une touche, puis relâcher", "computer")
+async def key_press(key: str) -> str:
+    """key: touche à presser (ex: escape, return, tab, f5, delete)"""
+    from computer.input import press
+    r = await press(key)
+    return f"✅ Touche {key}" if r["ok"] else f"❌ {r['error']}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# PARALLÉLISME — Kimi-Overdrive pattern
+# ═══════════════════════════════════════════════════════════════
+
+@tool(
+    "Exécuter plusieurs sous-tâches Ollama EN PARALLÈLE puis synthétiser (Kimi-Overdrive)",
+    "system",
+)
+async def parallel_tasks(tasks: str, model: str = "", max_concurrent: int = 5) -> str:
+    """
+    tasks: liste de tâches séparées par | (pipe)
+            ex: "Résume X | Analyse Y | Traduis Z"
+    model: modèle Ollama à utiliser (défaut: M_FAST)
+    max_concurrent: nombre max d'instances parallèles (défaut 5)
+
+    Exécute toutes les tâches simultanément, puis synthétise les résultats
+    en une réponse finale cohérente. Idéal pour les analyses multi-angles.
+    """
+    task_list = [t.strip() for t in tasks.split("|") if t.strip()]
+    if not task_list:
+        return "Aucune tâche fournie."
+
+    use_model  = model.strip() or CFG.M_FAST
+    semaphore  = asyncio.Semaphore(max_concurrent)
+
+    async def run_one(task: str, idx: int) -> tuple[int, str, str]:
+        async with semaphore:
+            prompt = (
+                f"Tâche (réponds directement et concisément, max 300 tokens) :\n{task}"
+            )
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as c:
+                    resp = await c.post(
+                        f"{CFG.OLLAMA}/api/chat",
+                        json={
+                            "model":    use_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream":   False,
+                            "options":  {"temperature": 0.5, "num_predict": 400},
+                        },
+                    )
+                output = resp.json().get("message", {}).get("content", "").strip()
+                return idx, task, output
+            except Exception as e:
+                return idx, task, f"[Erreur: {e}]"
+
+    # Lancement parallèle
+    results = await asyncio.gather(*[run_one(t, i) for i, t in enumerate(task_list)])
+    results.sort(key=lambda r: r[0])
+
+    # Rapport intermédiaire
+    parts = [f"**Tâche {i+1}** : {t}\n{out}" for i, t, out in results]
+    combined = "\n\n".join(parts)
+
+    if len(task_list) == 1:
+        return combined
+
+    # Synthèse finale
+    synth_prompt = (
+        f"Voici {len(task_list)} analyses réalisées en parallèle :\n\n{combined[:3000]}\n\n"
+        "Synthétise ces résultats en une réponse finale claire et complète."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as c:
+            resp = await c.post(
+                f"{CFG.OLLAMA}/api/chat",
+                json={
+                    "model":    CFG.M_GENERAL,
+                    "messages": [{"role": "user", "content": synth_prompt}],
+                    "stream":   False,
+                    "options":  {"temperature": 0.5, "num_predict": 800,
+                                 "num_ctx": CFG.NEMOTRON_CTX},
+                },
+            )
+        return resp.json().get("message", {}).get("content", combined)
+    except Exception:
+        return combined
+
+
+# ═══════════════════════════════════════════════════════════════
+# APPRENTISSAGE
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Consulter les règles apprises par La Ruche (SynapseLayer)", "memory")
+async def get_learned_rules(query: str = "") -> str:
+    """
+    query: chercher les règles pertinentes pour un sujet (vide = toutes les règles)
+    Retourne les règles générales extraites des missions passées.
+    """
+    from core.learning import get_learning_engine
+    engine = get_learning_engine()
+    if query.strip():
+        rules = engine.get_rules_for_query(query.strip())
+        header = f"Règles pertinentes pour '{query}' :"
+    else:
+        rules  = engine.get_learned_rules()[-20:]
+        header = "Règles apprises (20 dernières) :"
+    if not rules:
+        return "Aucune règle apprise pour le moment."
+    return header + "\n" + "\n".join(f"• {r}" for r in rules)
+
+
+@tool("Ajouter manuellement une règle dans la mémoire d'apprentissage", "memory")
+async def add_rule(rule: str) -> str:
+    """
+    rule: règle générale à mémoriser (ex: 'Toujours vérifier que Redis est actif avant...')
+    """
+    from core.learning import get_learning_engine
+    engine = get_learning_engine()
+    added  = engine.add_learned_rule(rule)
+    if added:
+        return f"✅ Règle ajoutée : {rule[:120]}"
+    return f"Règle déjà connue (ou trop courte) : {rule[:80]}"
+
+
+@tool("Lancer le cycle d'auto-amélioration nocturne immédiatement", "system")
+async def run_evolution() -> str:
+    """
+    Déclenche manuellement le cycle d'apprentissage/évolution de La Ruche :
+    analyse les missions récentes, génère des correctifs, les valide en sandbox.
+    Durée estimée : 2-5 minutes.
+    """
+    from core.learning import get_learning_engine
+    engine = get_learning_engine()
+    try:
+        report = await engine.evolve()
+        return (
+            f"✅ Évolution terminée — {report.date}\n"
+            f"Objectifs analysés: {report.goals_analyzed}\n"
+            f"Propositions: {report.proposals_generated} générées / "
+            f"{report.proposals_validated} validées / {report.proposals_applied} appliquées\n"
+            f"Règles apprises: {report.rules_learned}\n"
+            f"Prochain focus: {report.next_focus}"
+        )
+    except Exception as e:
+        return f"❌ Erreur évolution: {e}"
+
+
+@tool("Auto-réparer un fichier Python cassé via Claude Code CLI", "system")
+async def self_repair_file(file_path: str, error_description: str) -> str:
+    """
+    file_path: chemin absolu du fichier Python à réparer
+    error_description: description de l'erreur ou du problème observé
+
+    Génère un rapport de crash et appelle `claude -p` pour corriger automatiquement.
+    Nécessite que Claude Code CLI soit installé (npm install -g @anthropic-ai/claude-code).
+    """
+    from core.self_repair import SelfRepair
+    p = Path(file_path).expanduser()
+    if not p.exists():
+        return f"Fichier introuvable: {file_path}"
+
+    repairer = SelfRepair()
+    report   = repairer.generate_report(str(p.resolve()), error_description, "")
+    repaired = repairer.repair(str(p.resolve()), error_description, "")
+
+    if repaired:
+        return f"✅ Réparation signalée pour {file_path}\nRapport de crash: {report}"
+    return f"❌ Réparation impossible (Claude Code CLI requis)\nRapport: {report}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# ÉTAT DU MONDE
+# ═══════════════════════════════════════════════════════════════
+
+@tool("État système complet avec snapshot WorldState persistant", "system")
+async def world_state() -> str:
+    """
+    Retourne un snapshot complet de l'état du monde :
+    CPU, RAM, disque, app active, règles apprises, missions en attente.
+    Le snapshot est persisté dans ~/.ruche/world_state.json.
+    """
+    import psutil, platform
+    from watchdog import WorldState
+
+    # Snapshot système
+    cpu   = psutil.cpu_percent(interval=0.5)
+    mem   = psutil.virtual_memory()
+    disk  = psutil.disk_usage("/")
+    free_gb = disk.free / 1e9
+
+    snapshot = {
+        "cpu_percent":  cpu,
+        "ram_percent":  mem.percent,
+        "ram_used_gb":  round(mem.used / 1e9, 2),
+        "ram_total_gb": round(mem.total / 1e9, 2),
+        "disk_percent": disk.percent,
+        "disk_used_gb": round(disk.used / 1e9, 2),
+        "disk_free_gb": round(free_gb, 2),
+    }
+    WorldState.get_instance().update(snapshot)
+
+    # Règles apprises
+    from core.learning import get_learning_engine
+    rules_count = len(get_learning_engine().get_learned_rules())
+
+    lines = [
+        f"Système: {platform.node()} — macOS {platform.mac_ver()[0]}",
+        f"CPU: {cpu}% | RAM: {mem.percent}% ({mem.used//1e9:.1f}/{mem.total//1e9:.1f} GB)",
+        f"Disque: {disk.used//1e9:.1f}/{disk.total//1e9:.1f} GB ({disk.percent}%) — libre: {free_gb:.1f} GB",
+        f"Règles apprises: {rules_count}",
+        f"World state: ~/.ruche/world_state.json (mis à jour)",
+    ]
+    return "\n".join(lines)

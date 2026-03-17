@@ -379,9 +379,10 @@ class RucheMemory:
     async def get_context_for_query(self, query: str, session_id: str = "") -> str:
         """
         Construire un bloc de contexte à injecter dans le prompt de l'agent :
+        - Résumé de session actuelle (Redis)
         - Épisodes sémantiquement proches (ChromaDB)
         - Faits pertinents (ChromaDB knowledge)
-        - Résumé de session actuelle si disponible (Redis)
+        - Règles apprises pertinentes (SynapseLayer — core/learning.py)
 
         Retourne une chaîne formatée prête à être insérée dans le prompt.
         """
@@ -417,6 +418,15 @@ class RucheMemory:
             ]
             if fact_lines:
                 parts.append("[Faits mémorisés]\n" + "\n".join(fact_lines))
+
+        # 4. Règles apprises pertinentes (SynapseLayer)
+        try:
+            from core.learning import get_learning_engine
+            rules = get_learning_engine().get_rules_for_query(query, max_rules=4)
+            if rules:
+                parts.append("[Règles apprises]\n" + "\n".join(f"• {r}" for r in rules))
+        except Exception:
+            pass
 
         return "\n\n".join(parts) if parts else ""
 
@@ -474,6 +484,42 @@ class RucheMemory:
 
         logger.info(f"[Memory] forget({session_id}): redis={redis_deleted}, chroma={chroma_deleted}")
         return {"redis_deleted": redis_deleted, "chroma_deleted": chroma_deleted}
+
+    # ─── Enregistrement d'apprentissage après mission ─────────────────────────
+
+    async def record_mission_outcome(
+        self,
+        goal: str,
+        result: str,
+        success: bool,
+    ) -> bool:
+        """
+        Après l'exécution d'une mission :
+        - Sauvegarde l'épisode dans ChromaDB
+        - Si succès : extrait une règle via SynapseLayer (non bloquant)
+
+        Retourne True si au moins la sauvegarde Redis a réussi.
+        """
+        session_id = f"mission:{hash(goal) & 0xFFFF:04x}"
+        saved = await self.save(
+            session_id=session_id,
+            user_text=f"[MISSION] {goal}",
+            assistant_text=result[:500],
+            metadata={"type": "mission", "success": str(success)},
+        )
+
+        # Extraction de règle en arrière-plan si succès
+        if success:
+            try:
+                from core.learning import get_learning_engine
+                engine = get_learning_engine()
+                asyncio.create_task(
+                    engine._synapse.extract_rule_from_mission(goal, result)
+                )
+            except Exception:
+                pass
+
+        return saved
 
     # ─── Stats ────────────────────────────────────────────────────────────────
 

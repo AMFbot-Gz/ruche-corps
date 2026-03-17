@@ -5,6 +5,11 @@ Surveille: agent principal, worker, heartbeat
 Détecte: process mort, Redis injoignable, Ollama down, mémoire trop haute
 Répare: relance les services morts, notifie Telegram
 
+Améliorations (depuis ghost-os-ultimate/src/worldmodel/model.py) :
+  - WorldState : snapshot système thread-safe avec écriture atomique
+  - check_disk_free_gb() : seuil sur l'espace libre (pas seulement %)
+  - Seuils configurables via WATCHDOG_MEM_PCT / WATCHDOG_DISK_PCT
+
 Usage: python3 watchdog.py (daemon)
 """
 import asyncio
@@ -13,6 +18,8 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +32,104 @@ from config import CFG
 
 # ─── Configuration des services surveillés ────────────────────────────────────
 DIR = Path(__file__).parent.resolve()
+
+# Seuils configurables via env (surchargeables sans toucher au code)
+_MEM_THRESHOLD  = float(os.environ.get("WATCHDOG_MEM_PCT",  "85"))
+_DISK_THRESHOLD = float(os.environ.get("WATCHDOG_DISK_PCT", "90"))
+_DISK_FREE_MIN_GB = float(os.environ.get("WATCHDOG_DISK_FREE_GB", "2.0"))
+
+
+# ─── WorldState : snapshot système persistant (adapté de ghost-os-ultimate) ──
+
+class WorldState:
+    """
+    Snapshot thread-safe de l'état courant du système.
+    Persiste dans ~/.ruche/world_state.json via écriture atomique.
+    Singleton accessible via WorldState.get_instance().
+    """
+
+    _instance: "WorldState | None" = None
+    _instance_lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls) -> "WorldState":
+        with cls._instance_lock:
+            if cls._instance is None:
+                from config import RUCHE_DIR
+                cls._instance = cls(RUCHE_DIR / "world_state.json")
+            return cls._instance
+
+    def __init__(self, state_path: Path):
+        self._path  = Path(state_path)
+        self._lock  = threading.Lock()
+        self._state: dict = self._load()
+
+    def _load(self) -> dict:
+        try:
+            if self._path.exists():
+                raw = self._path.read_text(encoding="utf-8").strip()
+                if raw:
+                    return json.loads(raw)
+        except (json.JSONDecodeError, OSError):
+            pass
+        return {}
+
+    def _save(self) -> None:
+        """Écriture atomique via fichier temporaire (évite la corruption)."""
+        self._state["updated_at"] = datetime.now().isoformat()
+        payload = json.dumps(self._state, ensure_ascii=False, indent=2)
+        try:
+            dir_ = self._path.parent
+            dir_.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=dir_, prefix=".world_state_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                os.replace(tmp_path, self._path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            pass  # Non bloquant
+
+    def update(self, snapshot: dict) -> None:
+        """Fusionne un snapshot système dans l'état courant et persiste."""
+        with self._lock:
+            sys_keys = (
+                "cpu_percent", "ram_percent", "ram_used_gb", "ram_total_gb",
+                "disk_percent", "disk_used_gb", "disk_free_gb",
+            )
+            for k in sys_keys:
+                if k in snapshot:
+                    if "system" not in self._state:
+                        self._state["system"] = {}
+                    self._state["system"][k] = snapshot[k]
+            self._save()
+
+    def get_system(self) -> dict:
+        with self._lock:
+            return dict(self._state.get("system", {}))
+
+    def is_disk_space_low(self, threshold_gb: float = _DISK_FREE_MIN_GB) -> bool:
+        """True si l'espace libre est inférieur à threshold_gb."""
+        with self._lock:
+            free = self._state.get("system", {}).get("disk_free_gb")
+        if free is None:
+            return False
+        return float(free) < threshold_gb
+
+    def is_cpu_high(self, threshold: float = 80.0) -> bool:
+        with self._lock:
+            cpu = self._state.get("system", {}).get("cpu_percent")
+        return float(cpu) >= threshold if cpu is not None else False
+
+    def is_ram_critical(self, threshold: float = _MEM_THRESHOLD) -> bool:
+        with self._lock:
+            ram = self._state.get("system", {}).get("ram_percent")
+        return float(ram) >= threshold if ram is not None else False
 
 SERVICES = {
     "worker": {
@@ -89,18 +194,46 @@ class Watchdog:
             return False
 
     def check_memory(self) -> bool:
-        """Vérifie que la RAM est en dessous de 85%."""
+        """Vérifie que la RAM est en dessous du seuil configurable."""
         try:
-            return psutil.virtual_memory().percent < 85.0
+            return psutil.virtual_memory().percent < _MEM_THRESHOLD
         except Exception:
             return True
 
     def check_disk(self) -> bool:
-        """Vérifie que le disque est en dessous de 90%."""
+        """Vérifie que le disque est en dessous du seuil configurable."""
         try:
-            return psutil.disk_usage("/").percent < 90.0
+            return psutil.disk_usage("/").percent < _DISK_THRESHOLD
         except Exception:
             return True
+
+    def check_disk_free_gb(self) -> bool:
+        """Vérifie que l'espace libre est supérieur à _DISK_FREE_MIN_GB."""
+        try:
+            free_gb = psutil.disk_usage("/").free / 1e9
+            return free_gb >= _DISK_FREE_MIN_GB
+        except Exception:
+            return True
+
+    def _collect_world_snapshot(self) -> None:
+        """
+        Met à jour WorldState avec le snapshot système courant.
+        Permet aux autres modules d'accéder à l'état système sans psutil.
+        """
+        try:
+            mem  = psutil.virtual_memory()
+            disk = psutil.disk_usage("/")
+            WorldState.get_instance().update({
+                "cpu_percent":  psutil.cpu_percent(interval=0.1),
+                "ram_percent":  mem.percent,
+                "ram_used_gb":  round(mem.used / 1e9, 2),
+                "ram_total_gb": round(mem.total / 1e9, 2),
+                "disk_percent": disk.percent,
+                "disk_used_gb": round(disk.used / 1e9, 2),
+                "disk_free_gb": round(disk.free / 1e9, 2),
+            })
+        except Exception:
+            pass
 
     # ─── Redémarrage ─────────────────────────────────────────────────────────
 
@@ -166,6 +299,9 @@ class Watchdog:
 
     async def check_all(self):
         """Vérifie tous les services et ressources. Relance si nécessaire."""
+        # Mise à jour du WorldState (snapshot système pour les autres modules)
+        self._collect_world_snapshot()
+
         # Services avec PID file
         for svc_name in SERVICES:
             if not self.is_alive(svc_name):
@@ -194,18 +330,24 @@ class Watchdog:
         # Mémoire
         if not self.check_memory():
             mem_pct = psutil.virtual_memory().percent
-            await self._alert(f"[Watchdog] ALERTE : RAM à {mem_pct:.1f}% (seuil 85%)")
+            await self._alert(f"[Watchdog] ALERTE : RAM à {mem_pct:.1f}% (seuil {_MEM_THRESHOLD}%)")
             print(f"[Watchdog] Mémoire : CRITIQUE ({mem_pct:.1f}%)")
         else:
             print(f"[Watchdog] Mémoire : OK ({psutil.virtual_memory().percent:.1f}%)")
 
-        # Disque
+        # Disque (pourcentage)
         if not self.check_disk():
             disk_pct = psutil.disk_usage("/").percent
-            await self._alert(f"[Watchdog] ALERTE : Disque à {disk_pct:.1f}% (seuil 90%)")
+            await self._alert(f"[Watchdog] ALERTE : Disque à {disk_pct:.1f}% (seuil {_DISK_THRESHOLD}%)")
             print(f"[Watchdog] Disque : CRITIQUE ({disk_pct:.1f}%)")
         else:
             print(f"[Watchdog] Disque : OK ({psutil.disk_usage('/').percent:.1f}%)")
+
+        # Disque (espace libre absolu)
+        if not self.check_disk_free_gb():
+            free_gb = psutil.disk_usage("/").free / 1e9
+            await self._alert(f"[Watchdog] ALERTE : Espace libre disque {free_gb:.1f} GB (seuil {_DISK_FREE_MIN_GB} GB)")
+            print(f"[Watchdog] Espace libre : CRITIQUE ({free_gb:.1f} GB)")
 
     def _get_pid(self, service_name: str) -> int:
         """Lit le PID depuis le fichier PID."""
