@@ -142,6 +142,14 @@ SERVICES = {
     # agent et heartbeat surveillés mais non relancés — c'est main.py qui les gère
 }
 
+# ─── Containers Docker critiques surveillés ────────────────────────────────────
+# Clé = nom du container Docker, Valeur = label lisible pour les alertes
+DOCKER_SERVICES = {
+    "revenue-os-postgres": "Postgres",
+    "revenue-os-redis":    "Redis",
+    "n8n-openclaw":        "N8N",
+}
+
 # Intervalle de vérification (30s)
 CHECK_INTERVAL_SEC = 30
 
@@ -297,6 +305,42 @@ class Watchdog:
 
     # ─── Vérification globale ─────────────────────────────────────────────────
 
+    async def check_docker_services(self):
+        """
+        Vérifie que les containers Docker critiques sont en état 'running'.
+        Utilise `docker inspect --format='{{.State.Status}}' <name>`.
+        Les containers manquants ou stoppés déclenchent une alerte.
+        """
+        for container, label in DOCKER_SERVICES.items():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "inspect",
+                    "--format", "{{.State.Status}}",
+                    container,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                status = stdout.decode().strip()
+
+                if status == "running":
+                    print(f"[Watchdog] Docker {label} ({container}) : OK")
+                else:
+                    display = status if status else "introuvable"
+                    await self._alert(
+                        f"[Watchdog] ALERTE Docker : {label} ({container}) est '{display}'"
+                    )
+                    print(f"[Watchdog] Docker {label} ({container}) : {display.upper()}")
+
+            except asyncio.TimeoutError:
+                print(f"[Watchdog] Docker {label} : timeout inspection")
+            except FileNotFoundError:
+                # Docker non installé — on skip silencieusement
+                print("[Watchdog] Docker non installé — surveillance containers désactivée")
+                break
+            except Exception as e:
+                print(f"[Watchdog] Docker {label} : erreur ({e})")
+
     async def check_all(self):
         """Vérifie tous les services et ressources. Relance si nécessaire."""
         # Mise à jour du WorldState (snapshot système pour les autres modules)
@@ -348,6 +392,9 @@ class Watchdog:
             free_gb = psutil.disk_usage("/").free / 1e9
             await self._alert(f"[Watchdog] ALERTE : Espace libre disque {free_gb:.1f} GB (seuil {_DISK_FREE_MIN_GB} GB)")
             print(f"[Watchdog] Espace libre : CRITIQUE ({free_gb:.1f} GB)")
+
+        # Containers Docker critiques
+        await self.check_docker_services()
 
     def _get_pid(self, service_name: str) -> int:
         """Lit le PID depuis le fichier PID."""

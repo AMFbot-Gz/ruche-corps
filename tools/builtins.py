@@ -934,6 +934,103 @@ async def world_state() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# PROJETS LOCAUX
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Lister tous les projets locaux avec leur statut", "projects")
+async def list_projects() -> str:
+    """Retourne tous les projets dans ~/Projects/ avec type, git branch, dernier commit."""
+    from tools.integrations.projects_tool import list_projects as _list
+    projects = await _list()
+    if not projects:
+        return "Aucun projet trouvé dans ~/Projects/"
+    lines = ["Projets locaux :"]
+    for p in projects:
+        branch  = f" [{p['git_branch']}]" if p["git_branch"] else ""
+        running = " (actif)" if p["running"] else ""
+        lines.append(
+            f"  • {p['name']:<20} {p['type']:<8}{branch}{running}"
+            f"  — modifié {p['last_modified'][:10]}"
+        )
+    return "\n".join(lines)
+
+
+@tool("Statut détaillé d'un projet local (git, dépendances, services)", "projects")
+async def project_info(name: str) -> str:
+    """name: nom du projet (ex: 'moltbot', 'stitch', 'ruche-corps')"""
+    from tools.integrations.projects_tool import project_status as _status
+    info = await _status(name)
+    if "error" in info:
+        return info["error"]
+    lines = [
+        f"Projet : {info['name']} ({info['type']})",
+        f"Chemin : {info['path']}",
+        f"Dépendances : {info['dependencies']}",
+        f"Service actif : {'oui' if info['running'] else 'non'}",
+    ]
+    if info["main_files"]:
+        lines.append("Fichiers principaux :")
+        for f in info["main_files"][:5]:
+            lines.append(f"  {f}")
+    if info["scripts"]:
+        lines.append(f"Scripts : {', '.join(info['scripts'][:8])}")
+    if info["git_log"]:
+        lines.append(f"\nDerniers commits :\n{info['git_log']}")
+    if info["git_status"]:
+        lines.append(f"\nGit status :\n{info['git_status']}")
+    return "\n".join(lines)
+
+
+@tool("Chercher du code dans tous les projets locaux", "projects")
+async def search_projects(query: str, file_type: str = "") -> str:
+    """
+    query: texte à chercher (regex supporté)
+    file_type: extension sans point ('py', 'ts', 'js', '') — vide = tous
+    """
+    from tools.integrations.projects_tool import search_in_projects as _search
+    results = await _search(query, file_type)
+    if not results:
+        return f"Aucun résultat pour '{query}'" + (f" (type: {file_type})" if file_type else "")
+    lines = [f"{len(results)} résultat(s) pour '{query}' :"]
+    for r in results[:30]:
+        lines.append(
+            f"  [{r['project']}] {r['file']}:{r['line']}  {r['content'][:120]}"
+        )
+    if len(results) > 30:
+        lines.append(f"  ... ({len(results)-30} résultats supplémentaires)")
+    return "\n".join(lines)
+
+
+@tool("Ouvrir un projet dans Cursor/VSCode", "projects")
+async def open_project(name: str, editor: str = "cursor") -> str:
+    """
+    name: nom du projet dans ~/Projects/
+    editor: 'cursor' | 'code' | 'finder'
+    """
+    from tools.integrations.projects_tool import open_project as _open
+    return await _open(name, editor)
+
+
+@tool("Statut de Clawdbot (moltbot) — gateway, version, canaux", "projects")
+async def moltbot_status() -> str:
+    """Retourne le statut complet de Clawdbot : gateway actif, version, config."""
+    from tools.integrations.moltbot_tool import get_status, get_project_info
+    status = await get_status()
+    info   = await get_project_info()
+
+    lines = [
+        f"Clawdbot v{status.get('version', '?')}",
+        f"Gateway ({status.get('gateway_url')}) : {'actif' if status.get('gateway_running') else 'inactif'}",
+        f"CLI disponible : {'oui' if status.get('cli_available') else 'non'}",
+        f"Config ~/.clawdbot/ : {'présent' if status.get('config_dir_exists') else 'absent'}",
+        f"Build dist/ : {'oui' if info.get('built') else 'non (pnpm build requis)'}",
+    ]
+    if "error" not in info:
+        lines.append(f"Docs : {info.get('docs', 'https://docs.clawd.bot')}")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
 # SWARM — Délégation aux agents spécialistes
 # ═══════════════════════════════════════════════════════════════
 
@@ -956,3 +1053,159 @@ async def delegate_to_swarm(task: str, specialist: str = "auto") -> str:
         queen  = get_queen()
         result = await queen.execute(task)
         return f"[SWARM] {result}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# INTÉGRATIONS MACHINE
+# ═══════════════════════════════════════════════════════════════
+
+@tool("Requête SQL SELECT sur PostgreSQL (revenue-os-postgres)", "integrations")
+async def sql_query(query: str) -> str:
+    """query: requête SQL SELECT à exécuter"""
+    from tools.integrations.postgres_tool import query as pg_query
+    try:
+        rows = await pg_query(query)
+        if not rows:
+            return "Aucun résultat."
+        return json.dumps(rows, ensure_ascii=False, default=str, indent=2)[:4000]
+    except Exception as e:
+        return f"Erreur SQL: {e}"
+
+
+@tool("Exécuter INSERT/UPDATE/DELETE sur PostgreSQL", "integrations")
+async def sql_execute(query: str) -> str:
+    """query: requête SQL de modification (INSERT, UPDATE, DELETE)"""
+    from tools.integrations.postgres_tool import execute as pg_execute
+    try:
+        n = await pg_execute(query)
+        return f"OK — {n} ligne(s) affectée(s)."
+    except Exception as e:
+        return f"Erreur SQL: {e}"
+
+
+@tool("Lister les tables et schéma PostgreSQL", "integrations")
+async def sql_schema(table: str = "") -> str:
+    """table: nom de table (vide = lister toutes les tables)"""
+    from tools.integrations.postgres_tool import list_tables, describe_table
+    try:
+        if table.strip():
+            cols = await describe_table(table.strip())
+            if not cols:
+                return f"Table '{table}' introuvable ou vide."
+            lines = [f"Table: {table}"]
+            for c in cols:
+                nullable = "NULL" if c.get("is_nullable") == "YES" else "NOT NULL"
+                default  = f" DEFAULT {c['column_default']}" if c.get("column_default") else ""
+                lines.append(f"  {c['column_name']:30s} {c['data_type']:20s} {nullable}{default}")
+            return "\n".join(lines)
+        else:
+            tables = await list_tables()
+            if not tables:
+                return "Aucune table trouvée (base vide)."
+            return "Tables PostgreSQL (revenue_os):\n" + "\n".join(f"  • {t}" for t in tables)
+    except Exception as e:
+        return f"Erreur schéma: {e}"
+
+
+@tool("Lister et déclencher des workflows N8N", "integrations")
+async def n8n(action: str = "list", workflow_id: str = "", data: str = "{}") -> str:
+    """
+    action: 'list' | 'trigger' | 'executions'
+    workflow_id: ID du workflow (pour trigger/executions)
+    data: JSON string des données à envoyer (pour trigger)
+    """
+    from tools.integrations.n8n_tool import list_workflows, trigger_workflow, get_executions
+    try:
+        if action == "list":
+            wfs = await list_workflows()
+            if not wfs:
+                return "Aucun workflow N8N trouvé."
+            lines = []
+            for w in wfs:
+                status = "actif" if w.get("active") else "inactif"
+                lines.append(f"  [{w['id']}] {w['name']} — {status}")
+            return f"{len(wfs)} workflow(s) N8N:\n" + "\n".join(lines)
+
+        elif action == "trigger":
+            if not workflow_id:
+                return "workflow_id requis pour trigger."
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = {}
+            result = await trigger_workflow(workflow_id, payload)
+            return json.dumps(result, ensure_ascii=False, default=str, indent=2)[:2000]
+
+        elif action == "executions":
+            execs = await get_executions(workflow_id=workflow_id, limit=5)
+            if not execs:
+                return "Aucune exécution trouvée."
+            return json.dumps(execs, ensure_ascii=False, default=str, indent=2)[:3000]
+
+        else:
+            return f"Action inconnue: {action}. Disponibles: list, trigger, executions"
+    except Exception as e:
+        return f"Erreur N8N: {e}"
+
+
+@tool("Générer une image avec DALL-E 3 (OpenAI)", "integrations")
+async def generate_image(prompt: str, size: str = "1024x1024") -> str:
+    """
+    prompt: description de l'image à générer
+    size: '1024x1024' | '1792x1024' | '1024x1792'
+    """
+    from tools.integrations.openai_tool import generate_image as _gen
+    try:
+        path = await _gen(prompt, size=size)
+        return f"Image générée: {path}"
+    except Exception as e:
+        return f"Erreur génération image: {e}"
+
+
+@tool("Screenshot via Computer Use API (port 8015, claude-opus-4-6)", "integrations")
+async def cu_screenshot() -> str:
+    """Prend un screenshot via l'API Computer Use locale (claude-opus-4-6)."""
+    from tools.integrations.cu_api_tool import cu_screenshot as _screenshot
+    try:
+        data = await _screenshot()
+        b64 = data.get("base64", "")
+        resolution = data.get("resolution", "?")
+        img_hash   = data.get("hash", "")
+        # Sauvegarde locale optionnelle
+        if b64:
+            import base64 as _b64
+            from pathlib import Path
+            out_dir = Path.home() / ".ruche" / "screenshots"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            import time
+            path = out_dir / f"cu_{int(time.time())}.png"
+            path.write_bytes(_b64.b64decode(b64))
+            return f"Screenshot CU: {path} ({resolution}, hash={img_hash})"
+        return f"Screenshot pris ({resolution}) — base64 reçu ({len(b64)} chars)"
+    except Exception as e:
+        return f"Erreur CU screenshot: {e}"
+
+
+@tool("Statut et sessions Computer Use API", "integrations")
+async def cu_status() -> str:
+    """Retourne le statut complet de l'API Computer Use (sessions, modèle, display)."""
+    from tools.integrations.cu_api_tool import cu_get_status
+    try:
+        status = await cu_get_status()
+        lines = [
+            f"Computer Use API — {status.get('layer', 'CU')}",
+            f"  Mode:            {status.get('mode', '?')}",
+            f"  Modèle:          {status.get('cu_model', '?')}",
+            f"  Display:         {status.get('display', '?')}",
+            f"  Retina:          {status.get('retina', False)}",
+            f"  Sessions actives: {status.get('active_sessions', 0)}",
+            f"  Perception:      {'OK' if status.get('perception_ok') else 'indispo'}",
+            f"  Executor:        {'OK' if status.get('executor_ok') else 'indispo'}",
+            f"  Brain:           {'OK' if status.get('brain_ok') else 'indispo'}",
+        ]
+        display_info = status.get("display_info", {})
+        if display_info:
+            lines.append(f"  Display info:    {display_info}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Erreur CU status: {e}"

@@ -79,3 +79,12 @@ class CFG:
 
     # Logging
     LOG_LEVEL  = _e("LOG_LEVEL", "INFO")
+
+    # ── Bases de données ──────────────────────────────────────────
+    POSTGRES_URL  = _e("POSTGRES_URL", "postgresql://revenue_os:changeme123@localhost:5432/revenue_os")
+    REDIS_MAIN    = _e("REDIS_URL", "redis://localhost:6379")  # Redis principal (revenue-os)
+
+    # ── Services locaux ───────────────────────────────────────────
+    N8N_URL       = _e("N8N_URL", "http://localhost:5678")
+    N8N_API_KEY   = _e("N8N_API_KEY", "")
+    CU_API_URL    = _e("CU_API_URL", "http://localhost:8015")  # Computer Use API

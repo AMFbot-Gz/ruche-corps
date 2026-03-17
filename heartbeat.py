@@ -36,6 +36,13 @@ class HeartbeatService:
             self._disk_monitor(),
         )
 
+    # ─── Containers Docker critiques à surveiller ─────────────────────────
+    DOCKER_SERVICES = {
+        "revenue-os-postgres": "Postgres",
+        "revenue-os-redis":    "Redis",
+        "n8n-openclaw":        "N8N",
+    }
+
     # ─── Boucle de santé (60s) ────────────────────────────────────────────
     async def _health_loop(self):
         checks = {
@@ -44,6 +51,7 @@ class HeartbeatService:
             "Comp. Use": f"{CFG.GHOST_CU}/health",
         }
         while True:
+            # Vérification des services HTTP
             async with httpx.AsyncClient(timeout=5.0) as c:
                 for name, url in checks.items():
                     try:
@@ -57,7 +65,58 @@ class HeartbeatService:
                             await self._alert(f"⚠️ {name} est tombé, {CFG.OWNER}.", "warn")
                             self._down[name] = True
                             log.warning("service_down", service=name, error=str(e))
+
+            # Vérification des containers Docker critiques
+            await self._check_docker_services()
+
             await asyncio.sleep(60)
+
+    async def _check_docker_services(self):
+        """
+        Vérifie que les containers Docker critiques sont en état 'running'.
+        Utilise `docker inspect --format='{{.State.Status}}' <name>` pour chaque container.
+        """
+        for container, label in self.DOCKER_SERVICES.items():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "inspect",
+                    "--format", "{{.State.Status}}",
+                    container,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                status = stdout.decode().strip()
+
+                service_key = f"docker:{container}"
+                if status == "running":
+                    # Container de retour après une panne
+                    if self._down.get(service_key):
+                        await self._alert(
+                            f"Docker {label} ({container}) est de retour en ligne, {CFG.OWNER}.",
+                            "info",
+                        )
+                        self._down[service_key] = False
+                        log.info("docker_recovered", container=container)
+                else:
+                    # Container absent (not found) ou dans un état anormal
+                    display_status = status or "introuvable"
+                    if not self._down.get(service_key):
+                        await self._alert(
+                            f"⚠️ Docker {label} ({container}) : état '{display_status}', {CFG.OWNER}.",
+                            "warn",
+                        )
+                        self._down[service_key] = True
+                        log.warning("docker_not_running",
+                                    container=container, status=display_status)
+            except asyncio.TimeoutError:
+                log.warning("docker_check_timeout", container=container)
+            except FileNotFoundError:
+                # Docker non installé — on ne surveille pas dans ce cas
+                log.debug("docker_not_installed")
+                break
+            except Exception as e:
+                log.warning("docker_check_error", container=container, error=str(e))
 
     # ─── Briefing matinal (8h00) ──────────────────────────────────────────
     async def _briefing_loop(self):

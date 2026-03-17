@@ -152,13 +152,24 @@ class ContextBuilder:
         # Mots-clés dans la requête → fichiers correspondants
         q_lower = query.lower()
         keywords = {
-            "config": ["config.py", "*.yml", "*.yaml", "*.toml", ".env"],
-            "agent":  ["agent.py", "agent/core.py", "main.py"],
-            "tool":   ["tools/builtins.py", "tools/registry.py"],
-            "memory": ["memory.py", "agent/memory.py"],
-            "telegram": ["senses/telegram.py"],
-            "voice":  ["senses/voice.py"],
-            "computer": ["computer/input.py", "computer/screen.py", "computer/sandbox.py"],
+            "config":    ["config.py", "*.yml", "*.yaml", "*.toml", ".env"],
+            "agent":     ["agent.py", "agent/core.py", "main.py"],
+            "tool":      ["tools/builtins.py", "tools/registry.py"],
+            "memory":    ["memory.py", "agent/memory.py"],
+            "telegram":  ["senses/telegram.py"],
+            "voice":     ["senses/voice.py"],
+            "computer":  ["computer/input.py", "computer/screen.py", "computer/sandbox.py"],
+            # ─── Projets locaux ───────────────────────────────────
+            "moltbot":   ["~/Projects/moltbot/"],
+            "clawdbot":  ["~/Projects/moltbot/"],
+            "clawd":     ["~/Projects/moltbot/"],
+            "stitch":    ["~/Projects/stitch/"],
+            "n8n":       ["tools/integrations/n8n_tool.py"],
+            "postgres":  ["tools/integrations/postgres_tool.py"],
+            "sql":       ["tools/integrations/postgres_tool.py"],
+            "database":  ["tools/integrations/postgres_tool.py"],
+            "projet":    ["tools/integrations/projects_tool.py"],
+            "projects":  ["tools/integrations/projects_tool.py"],
         }
         for kw, patterns in keywords.items():
             if kw in q_lower:
