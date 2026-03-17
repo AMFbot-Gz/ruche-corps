@@ -1,0 +1,256 @@
+"""
+agent.py — Cerveau de La Ruche v2.0
+
+Architecture Claude :
+  - Nemotron-3-Super comme modèle principal (230B, contexte 128K)
+  - Context Builder injecte les fichiers pertinents dans le prompt
+  - Boucle ReAct : Penser → Appeler outils → Observer → Itérer
+  - Exécution parallèle des outils indépendants
+  - Mémoire vectorielle + sessions Redis TTL 2h
+  - Streaming token-par-token vers ruche:stream
+"""
+import asyncio
+import json
+import re
+import time
+from datetime import datetime
+
+import httpx
+import redis.asyncio as aioredis
+
+from config import CFG
+from memory import Memory
+from router import Router
+from tools.registry import registry
+from context.builder import ContextBuilder
+
+# ═══════════════════════════════════════════════════════════════
+# SYSTEM PROMPT — Définit l'identité et les capacités
+# ═══════════════════════════════════════════════════════════════
+SYSTEM = """\
+Tu es {name} — agent IA souverain et spécialiste universel de {owner}.
+Tu disposes de {n_tools} outils pour agir directement sur le Mac, le web, le code et la mémoire.
+
+CAPACITÉS COMPLÈTES :
+→ Développement : Python, JS, Go, Rust, SQL, bash, tout langage
+→ Computer Use  : voir l'écran, cliquer, taper, ouvrir des apps, scripter macOS
+→ Fichiers      : lire, écrire, modifier, analyser n'importe quel fichier
+→ Web           : rechercher, récupérer, analyser des pages
+→ GitHub        : repos, issues, PRs, recherche de code
+→ Code          : éditer avec aider+qwen3-coder, analyser, refactoriser
+→ Mémoire       : mémoriser et rappeler des faits importants
+→ Contexte 1M   : charger des projets entiers avec load_context()
+
+STRATÉGIE DE TRAVAIL (ReAct) :
+1. ANALYSER l'objectif réel (pas juste la demande de surface)
+2. PLANIFIER les étapes en silence (pas besoin de les énoncer)
+3. AGIR avec les outils dans l'ordre le plus efficace
+4. VÉRIFIER le résultat de chaque étape
+5. CORRIGER automatiquement si ça ne marche pas
+6. RÉPONDRE clairement une fois terminé
+
+RÈGLES ABSOLUES :
+- Tu agis, tu ne délègues pas et tu ne demandes pas de confirmation
+- "Je ne peux pas" n'existe pas — trouver le chemin alternatif
+- Pour le code : utiliser code_edit() avec aider (Claude Code local)
+- Pour l'écran : utiliser see_screen() avant de cliquer
+- Pour les projets complexes : utiliser load_context() pour charger les fichiers
+- Pour les questions très difficiles : utiliser mixture_answer()
+- Mémoriser avec remember() ce qui sera utile plus tard
+
+OUTILS DISPONIBLES : {tools}
+
+DATE/HEURE : {dt}
+{context}
+"""
+
+
+class RucheAgent:
+    def __init__(self):
+        self.redis    = None
+        self.memory   = Memory()
+        self.router   = Router()
+        self.ctx      = ContextBuilder()
+        self._http    = httpx.AsyncClient(timeout=180.0)
+        import tools.builtins  # enregistrement @tool
+
+    # ── Démarrage ─────────────────────────────────────────────
+    async def start(self):
+        self.redis = await aioredis.from_url(CFG.REDIS)
+        await self.redis.ping()
+        await self.memory.initialize()
+        tools_list = registry.list_tools()
+        print(f"[Agent] ✅ Redis + ChromaDB prêts")
+        print(f"[Agent] ✅ {len(tools_list)} outils: {', '.join(tools_list)}")
+        print(f"[Agent] 🧠 Modèle principal: {CFG.M_GENERAL} ({CFG.NEMOTRON_CTX//1000}K ctx)")
+        print(f"[Agent] 🔴 Écoute sur {CFG.CH_IN}")
+        async with self.redis.pubsub() as ps:
+            await ps.subscribe(CFG.CH_IN)
+            async for msg in ps.listen():
+                if msg["type"] == "message":
+                    try:
+                        asyncio.create_task(self._dispatch(json.loads(msg["data"])))
+                    except Exception as e:
+                        print(f"[Agent] Dispatch error: {e}")
+
+    # ── Dispatch d'un message ─────────────────────────────────
+    async def _dispatch(self, data: dict):
+        t0      = time.monotonic()
+        channel = data.get("channel", "cli")
+        uid     = data.get("user_id", "local")
+        text    = data.get("text", "").strip()
+        sid     = f"{channel}:{uid}"
+        if not text:
+            return
+        print(f"[Agent] [{channel}] {text[:80]}")
+
+        # Routage modèle
+        route = await self.router.classify(text)
+        model = route.model
+        print(f"[Agent] → {model} ({route.reasoning_type}) {route.latency_ms:.0f}ms")
+
+        # Mémoire vectorielle
+        mem_ctx   = await self.memory.search_relevant(text, n=3, session_id=sid)
+        facts_ctx = await self.memory.search_facts(text, n=2)
+        mem_text  = "\n".join(filter(None, [mem_ctx, facts_ctx])) or ""
+
+        # Context builder — auto-détection des fichiers pertinents
+        file_ctx = ""
+        if any(kw in text.lower() for kw in ["fichier", "code", "projet", "analyser", "lire", "charger"]):
+            auto_files = self.ctx.auto_files_for_query(text)
+            if auto_files:
+                file_ctx = self.ctx.build(query=text, files=auto_files, memory=mem_text)
+
+        context_block = ""
+        if file_ctx:
+            context_block = f"\n📂 CONTEXTE AUTO-CHARGÉ:\n{file_ctx[:8000]}\n"
+        elif mem_text:
+            context_block = f"\n📡 MÉMOIRE:\n{mem_text[:1000]}\n"
+
+        # Historique session
+        history = await self._history_get(sid)
+
+        # System prompt avec Nemotron
+        system = SYSTEM.format(
+            name=CFG.NAME,
+            owner=CFG.OWNER,
+            n_tools=len(registry.list_tools()),
+            tools=", ".join(registry.list_tools()),
+            dt=datetime.now().strftime("%A %d %B %Y — %H:%M"),
+            context=context_block,
+        )
+
+        messages = history + [{"role": "user", "content": text}]
+        answer   = await self._loop(model, system, messages, sid)
+
+        # Persistance
+        await self.memory.save(sid, text, answer)
+        await self._history_set(sid, text, answer)
+
+        ms = (time.monotonic() - t0) * 1000
+        print(f"[Agent] Répondu en {ms:.0f}ms | {answer[:60]}...")
+
+        await self.redis.publish(CFG.CH_OUT, json.dumps({
+            "channel":    channel,
+            "user_id":    uid,
+            "session_id": sid,
+            "response":   answer,
+            "model":      model,
+            "ms":         ms,
+        }))
+
+    # ── Boucle ReAct LLM ↔ Outils ────────────────────────────
+    async def _loop(self, model: str, system: str, messages: list,
+                    sid: str, max_iter: int = 15) -> str:
+        tools = registry.get_schemas()
+        msgs  = messages.copy()
+
+        # Options Nemotron : grand contexte + température calibrée
+        is_nemotron = "nemotron" in model.lower()
+        options = {
+            "temperature": CFG.NEMOTRON_TEMP if is_nemotron else 0.7,
+            "num_predict": 3000,
+        }
+        if is_nemotron:
+            options["num_ctx"] = CFG.NEMOTRON_CTX
+
+        for i in range(max_iter):
+            payload = {
+                "model":   model,
+                "messages": [{"role": "system", "content": system}] + msgs,
+                "stream":   True,
+                "tools":    tools,
+                "options":  options,
+            }
+            content    = ""
+            tool_calls = []
+
+            try:
+                async with self._http.stream("POST", f"{CFG.OLLAMA}/api/chat",
+                                              json=payload) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except Exception:
+                            continue
+                        m = chunk.get("message", {})
+                        if m.get("content"):
+                            content += m["content"]
+                            # Streaming token-par-token
+                            await self.redis.publish(CFG.CH_STREAM, json.dumps(
+                                {"session_id": sid, "token": m["content"]}
+                            ))
+                        for tc in m.get("tool_calls", []):
+                            fn = tc.get("function", {})
+                            tool_calls.append({
+                                "name":      fn.get("name", ""),
+                                "arguments": fn.get("arguments", {}),
+                            })
+            except Exception as e:
+                print(f"[Agent] LLM error iter={i}: {e}")
+                if content:
+                    return content.strip()
+                return f"Erreur de connexion au modèle: {e}"
+
+            # Pas d'outils → réponse finale
+            if not tool_calls:
+                return content.strip() or "Réponse vide du modèle."
+
+            # Exécution parallèle des outils
+            names = [tc["name"] for tc in tool_calls]
+            print(f"[Agent] iter={i+1} outils={names}")
+            results = await registry.execute_parallel(tool_calls)
+
+            # Réinjecter dans le contexte
+            if content:
+                msgs.append({
+                    "role":       "assistant",
+                    "content":    content,
+                    "tool_calls": tool_calls,
+                })
+            for tc, res in zip(tool_calls, results):
+                msgs.append({
+                    "role":    "tool",
+                    "content": json.dumps(res, ensure_ascii=False)[:4000],
+                })
+
+        return content.strip() or "Impossible de terminer après plusieurs tentatives."
+
+    # ── Historique Redis TTL 2h ────────────────────────────────
+    async def _history_get(self, sid: str) -> list:
+        d = await self.redis.get(f"ruche:session:{sid}")
+        return json.loads(d)[-20:] if d else []
+
+    async def _history_set(self, sid: str, user: str, assistant: str):
+        h  = await self._history_get(sid)
+        h += [{"role": "user",      "content": user},
+              {"role": "assistant", "content": assistant}]
+        await self.redis.setex(f"ruche:session:{sid}", 7200, json.dumps(h))
+
+    # ── Arrêt propre ──────────────────────────────────────────
+    async def stop(self):
+        await self.router.close()
+        await self.memory.close()
+        await self._http.aclose()
